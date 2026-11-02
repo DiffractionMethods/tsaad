@@ -216,7 +216,7 @@ class DetectorConfig:
             cascade_factor=cascade_factor,
             pixel_factor=0.0,
             pedestal=0.0,
-            psf_kernel=timepix_cluster_psf(center_weight=center_weight, radius=2),
+            psf_kernel=timepix_cluster_psf(center_weight=center_weight, radius=1),
             psf_mode=psf_mode,
         )
 
@@ -309,8 +309,8 @@ def _generate_background_quanta_field(
     base_2d = cfg.bg_min_quanta + (cfg.bg_max_quanta - cfg.bg_min_quanta) * radial_norm
 
     if cfg.include_sparse_corner:
-        # Make outer corners (r > 1.05) ultra-low flux for testing single-event cluster isolation
-        corner_weight = np.clip((r - 0.95) / 0.25, 0.0, 1.0)
+        # Make outer corners (r > 0.98) ultra-low flux for testing single-event cluster isolation
+        corner_weight = np.clip((r - 0.88) / 0.10, 0.0, 1.0)
         base_2d = (1.0 - corner_weight) * base_2d + corner_weight * cfg.sparse_corner_quanta
 
     # Evolve smoothly with rotation angle phi(t)
@@ -325,7 +325,7 @@ def _generate_background_quanta_field(
 
     if cfg.include_sparse_corner:
         # Keep the sparse corners strictly near sparse_corner_quanta
-        sparse_mask = r > 1.08
+        sparse_mask = r > 0.98
         for t_idx in range(cfg.n_frames):
             bg_3d[t_idx, sparse_mask] = beam_flux[t_idx] * cfg.sparse_corner_quanta
 
@@ -395,32 +395,35 @@ def _sample_cascade_and_psf(
         ys, xs = np.nonzero(frame_n)
         counts_primary = frame_n[ys, xs]
         if excess <= 1e-12:
-            m_float = counts_primary.astype(np.float64) * det.gain
+            m_int = np.rint(counts_primary.astype(np.float64) * det.gain).astype(
+                np.int64
+            )
         else:
-            # Gamma-distributed continuous multiplicity, then rounded/Poisson-sampled so
-            # Var(M) matches G^2 * (gamma - 1)
-            # Note: If M | Lambda_M ~ Poisson(Lambda_M), Var(M) = E[Lambda_M] + Var(Lambda_M).
-            # For Var(M) = n * G^2 * (gamma - 1), we need Var(Lambda_M) = n * (G^2*(gamma - 1) - G).
+            # Each absorbed primary quantum triggers at least 1 secondary count (M = n + delta_M)
+            # when G >= 1, with E[delta_M | n] = n*(G - 1) and Var(delta_M | n) = n*G^2*(gamma - 1).
             target_var_per_event = (det.gain**2) * excess
-            if target_var_per_event > det.gain:
+            mean_delta = max(det.gain - 1.0, 0.0)
+            if det.gain >= 1.0 and target_var_per_event > mean_delta and mean_delta > 0:
+                var_lambda = target_var_per_event - mean_delta
+                shape_l = counts_primary * (mean_delta**2) / var_lambda
+                scale_l = var_lambda / mean_delta
+                lambda_m = rng.gamma(shape=shape_l, scale=scale_l)
+                m_int = counts_primary + rng.poisson(lambda_m)
+            elif target_var_per_event > det.gain:
                 var_lambda = target_var_per_event - det.gain
                 shape_l = counts_primary * (det.gain**2) / var_lambda
                 scale_l = var_lambda / det.gain
                 lambda_m = rng.gamma(shape=shape_l, scale=scale_l)
-                m_total = rng.poisson(lambda_m)
+                m_int = rng.poisson(lambda_m)
             else:
-                # Sub-Poisson cluster multiplicity (e.g. fixed cluster size around G):
-                # use normal approximation rounded to >= 1
+                # Sub-Poisson cluster multiplicity: use normal approximation rounded to >= counts_primary
                 sd = np.sqrt(counts_primary * target_var_per_event)
-                m_total = np.maximum(
-                    1,
+                m_int = np.maximum(
+                    counts_primary,
                     np.rint(
                         rng.normal(counts_primary * det.gain, sd)
                     ).astype(np.int64),
                 )
-            m_float = m_total
-
-        m_int = np.rint(m_float).astype(np.int64)
         # Partition m_int across the ky*kx kernel offsets via multinomial
         splits = rng.multinomial(m_int, probs)  # shape (n_active, ky*kx)
         padded = np.zeros((height + 2 * ry, width + 2 * rx), dtype=np.float64)

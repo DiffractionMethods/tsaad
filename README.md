@@ -135,6 +135,39 @@ cov_matrix = custom_detector.theoretical_covariance_kernel(mu_adu=50.0)
 
 ---
 
+## Estimating Detector Response Statistics (`detector_stats.pipeline`)
+
+Use `estimate_detector_statistics` to run the complete four-stage pipeline (anomaly masking $\rightarrow$ spatiotemporal detrending $\rightarrow$ lagged cross-covariance regression $\rightarrow$ $G$/$\gamma$ separation) on any 3D rotation-scan image stack `(n_frames, height, width)`:
+
+```python
+from detector_stats import (
+    DetectorConfig,
+    SceneConfig,
+    estimate_detector_statistics,
+    simulate_rotation_scan,
+)
+
+# Simulate a 3D ED Timepix rotation scan with a low-flux corner
+det = DetectorConfig.ed_pad_timepix(gain=2.9, cascade_factor=1.35)
+scene = SceneConfig(n_frames=60, height=128, width=128, include_sparse_corner=True)
+sim = simulate_rotation_scan(det, scene, seed=42)
+
+# Estimate (G, gamma, psi) directly from the image stack
+report = estimate_detector_statistics(
+    sim.images,
+    pedestal=det.pedestal,
+    trend_method="hollow_stencil_kriging",  # or "low_rank_spline", "temporal_difference"
+)
+
+print(f"Estimated G * gamma : {report.g_gamma:.3f} +- {report.covariance.g_gamma_se:.3f}")
+print(f"Estimated gain G    : {report.gain:.3f} (method: {report.separation.separation_method})")
+print(f"Estimated cascade γ : {report.cascade_factor:.3f}")
+print(f"Estimated noise ψ   : {report.psi:.3f} +- {report.covariance.psi_se:.3f}")
+print(f"Detected PSF radius : {report.psf_radius} px (S_2 = {report.s2_factor:.3f})")
+```
+
+---
+
 ## Running Tests
 
 Run the test suite with `pytest`:
