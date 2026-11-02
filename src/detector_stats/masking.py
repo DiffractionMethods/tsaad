@@ -27,12 +27,12 @@ class MaskingConfig:
     dead_pixel_rel_threshold: float = 0.08
     shadow_rel_threshold: float = 0.05
     # Sliding-window temporal outlier detection (Bragg spots & zingers)
-    temporal_window: int = 15
-    transient_seed_sigma: float = 4.5
-    transient_cluster_sigma: float = 2.8
-    transient_wing_sigma: float = 1.4
-    dilation_t: int = 2
-    dilation_xy: int = 3
+    temporal_window: int = 21
+    transient_seed_sigma: float = 5.0
+    transient_cluster_sigma: float = 4.0
+    transient_wing_sigma: float = 1.8
+    dilation_t: int = 1
+    dilation_xy: int = 2
 
 
 @dataclass
@@ -232,30 +232,35 @@ def detect_transient_outliers(
     rough_flux = estimate_rough_frame_flux(y_sub, static_bad_mask=static_bad_mask)
     y_norm = y_sub / rough_flux[:, None, None]
 
-    # Sliding-window temporal median along axis 0 (time)
-    win_t = min(max(5, int(config.temporal_window) | 1), n_frames)
-    if n_frames <= 15:
+    # Sliding-window temporal median along axis 0 (time) with window >= 21 frames and wrap
+    # padding so a Bragg spot near t=0 or t=T-1 is never reflected onto itself.
+    win_t = min(max(21, int(config.temporal_window) | 1), n_frames)
+    if n_frames <= 19:
         temp_med = np.median(y_norm, axis=0, keepdims=True)
         abs_dev = np.abs(y_norm - temp_med)
         mad_t = 1.4826 * np.median(abs_dev, axis=0, keepdims=True)
     else:
-        temp_med = median_filter(y_norm, size=(win_t, 1, 1), mode="reflect")
+        temp_med = median_filter(y_norm, size=(win_t, 1, 1), mode="wrap")
         abs_dev = np.abs(y_norm - temp_med)
-        mad_t = 1.4826 * median_filter(abs_dev, size=(win_t, 1, 1), mode="reflect")
+        mad_t = 1.4826 * median_filter(abs_dev, size=(win_t, 1, 1), mode="wrap")
 
-    # Regularize the temporal MAD scale spatially (over 7x7 neighborhoods) so single pixels
-    # with quantized/low-count draws never get an artificially tiny denominator.
+    # Regularize the temporal MAD scale spatially (over 7x7 neighborhoods) so neither single pixels
+    # with quantized/low-count draws nor pixels hit by Bragg spots get a biased scale.
     mean_mad_2d = np.median(mad_t, axis=0)
     if np.any(static_bad_mask):
-        fill_val = float(np.median(mean_mad_2d[~static_bad_mask])) if np.any(~static_bad_mask) else 1.0
-        mean_mad_2d_clean = np.where(static_bad_mask, fill_val, mean_mad_2d)
+        fill_val = (
+            float(np.median(mean_mad_2d[~static_bad_mask]))
+            if np.any(~static_bad_mask)
+            else 1.0
+        )
+        mad_2d_clean = np.where(static_bad_mask, fill_val, mean_mad_2d)
     else:
-        mean_mad_2d_clean = mean_mad_2d
-    spatial_scale_2d = median_filter(mean_mad_2d_clean, size=7, mode="nearest")
+        mad_2d_clean = mean_mad_2d
+    spatial_scale_2d = median_filter(mad_2d_clean, size=7, mode="nearest")
 
     # Poisson/discrete floor prevents false-positive clipping in ultra-low-flux sparse corners
     poisson_floor = np.sqrt(np.maximum(temp_med, 1.5))
-    sigma_eff = np.maximum(mad_t, np.maximum(spatial_scale_2d[None, :, :], poisson_floor))
+    sigma_eff = np.maximum(spatial_scale_2d[None, :, :], poisson_floor)
 
     # Positive excess z-score (Bragg spots and cosmic-ray zingers are positive spikes)
     z_pos = (y_norm - temp_med) / (sigma_eff + 1e-6)
@@ -273,20 +278,12 @@ def detect_transient_outliers(
     # Do not seed from static bad pixels
     seed_mask &= ~static_bad_mask[None, :, :]
 
-    # Propagate seeds into contiguous reflection halos via hysteresis thresholding,
-    # then dilate in 3D (t, y, x) to mask out weak Bragg reflection wings and PSF tails
-    if np.any(seed_mask):
-        wing_candidates = ((smooth_z > config.transient_wing_sigma) | (z_pos > 2.0)) & (
-            ~static_bad_mask[None, :, :]
-        )
-        grown_mask = binary_propagation(seed_mask, mask=wing_candidates | seed_mask)
-        if config.dilation_t > 0 or config.dilation_xy > 0:
-            st_t = 2 * max(0, config.dilation_t) + 1
-            st_xy = 2 * max(0, config.dilation_xy) + 1
-            struct = np.ones((st_t, st_xy, st_xy), dtype=bool)
-            transient_mask = binary_dilation(grown_mask, structure=struct)
-        else:
-            transient_mask = grown_mask
+    # Bounded 3D dilation in (t, y, x) around seeds to mask Bragg reflection wings without percolation
+    if np.any(seed_mask) and (config.dilation_t > 0 or config.dilation_xy > 0):
+        st_t = 2 * max(0, config.dilation_t) + 1
+        st_xy = 2 * max(0, config.dilation_xy) + 1
+        struct = np.ones((st_t, st_xy, st_xy), dtype=bool)
+        transient_mask = binary_dilation(seed_mask, structure=struct)
     else:
         transient_mask = seed_mask
 

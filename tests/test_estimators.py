@@ -8,10 +8,13 @@ import pytest
 from detector_stats import (
     DetectorConfig,
     SceneConfig,
+    delta_psf,
     detect_static_bad_pixels,
     detect_transient_outliers,
     estimate_detector_statistics,
     estimate_incident_flux_scale,
+    gaussian_psf,
+    lorentzian_psf,
     simulate_rotation_scan,
 )
 
@@ -188,3 +191,185 @@ def test_ed_pad_timepix_sparse_cluster_separation(trend_method: str) -> None:
     assert abs(rep.gain - det.gain) < 0.05
     assert abs(rep.cascade_factor - det.cascade_factor) < 0.05
     assert np.isclose(rep.gain * rep.cascade_factor, rep.g_gamma, rtol=1e-12)
+
+
+def test_multi_seed_monte_carlo_ensemble() -> None:
+    """Verify unbiasedness and absence of outlier failures across a multi-seed Monte Carlo ensemble."""
+    scene_ccd = SceneConfig(n_frames=45, height=104, width=104, n_bragg_spots=55, n_zingers=12)
+    det_ccd = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
+
+    gg_ccd: list[float] = []
+    psi_ccd: list[float] = []
+    for seed in range(8):
+        sim = simulate_rotation_scan(det_ccd, scene_ccd, seed=seed)
+        rep = estimate_detector_statistics(sim.images, pedestal=det_ccd.pedestal)
+        gg_ccd.append(rep.g_gamma)
+        psi_ccd.append(rep.psi)
+        # Every individual seed must stay within 10% of true G*gamma and 0.6 ADU^2 of true psi
+        assert np.isclose(rep.g_gamma, det_ccd.g_gamma, rtol=0.10)
+        assert np.isclose(rep.psi, det_ccd.pixel_factor, atol=0.60)
+
+    # Ensemble mean across seeds must be within 3.5% of true G*gamma and 0.25 ADU^2 of true psi
+    assert np.isclose(float(np.mean(gg_ccd)), det_ccd.g_gamma, rtol=0.035)
+    assert np.isclose(float(np.mean(psi_ccd)), det_ccd.pixel_factor, atol=0.25)
+
+    # Also test multi-seed ensemble on 3D ED Timepix with sparse single-event cluster separation
+    det_ed = DetectorConfig.ed_pad_timepix()
+    scene_ed = SceneConfig(
+        n_frames=45,
+        height=112,
+        width=112,
+        include_sparse_corner=True,
+        sparse_corner_quanta=0.008,
+        n_bragg_spots=50,
+    )
+    g_ed: list[float] = []
+    gamma_ed: list[float] = []
+    for seed in range(5):
+        sim = simulate_rotation_scan(det_ed, scene_ed, seed=100 + seed)
+        rep = estimate_detector_statistics(sim.images, pedestal=det_ed.pedestal)
+        assert rep.separation.separated is True
+        g_ed.append(rep.gain)
+        gamma_ed.append(rep.cascade_factor)
+
+    assert abs(float(np.mean(g_ed)) - det_ed.gain) < 0.06
+    assert abs(float(np.mean(gamma_ed)) - det_ed.cascade_factor) < 0.05
+
+
+@pytest.mark.parametrize(
+    "det_cfg,has_sparse",
+    [
+        # 1. Sub-unity gain detector with Gaussian PSF
+        (
+            DetectorConfig(
+                name="low_gain_cmos",
+                gain=0.45,
+                cascade_factor=1.60,
+                pixel_factor=2.50,
+                pedestal=100.0,
+                psf_kernel=gaussian_psf(sigma_px=0.8, radius=3),
+                psf_mode="continuous",
+            ),
+            False,
+        ),
+        # 2. High-gain, heavy-cascade phosphor detector with Lorentzian PSF
+        (
+            DetectorConfig(
+                name="high_gain_phosphor",
+                gain=4.20,
+                cascade_factor=2.10,
+                pixel_factor=18.0,
+                pedestal=25.0,
+                psf_kernel=lorentzian_psf(fwhm_px=1.4, radius=3),
+                psf_mode="continuous",
+            ),
+            False,
+        ),
+        # 3. Zero-PSF integrating detector with readout noise
+        (
+            DetectorConfig(
+                name="delta_psf_integrating",
+                gain=1.80,
+                cascade_factor=1.30,
+                pixel_factor=6.00,
+                pedestal=10.0,
+                psf_kernel=delta_psf(0),
+                psf_mode="continuous",
+            ),
+            False,
+        ),
+        # 4. High-multiplicity discrete cluster detector with sparse corner
+        (
+            DetectorConfig.ed_pad_timepix(gain=3.80, cascade_factor=1.45),
+            True,
+        ),
+    ],
+)
+def test_parameter_sweep_across_detector_configurations(
+    det_cfg: DetectorConfig, has_sparse: bool
+) -> None:
+    """Verify recovery across diverse (G, gamma, psi, PSF) parameter combinations."""
+    scene = SceneConfig(
+        n_frames=50,
+        height=112,
+        width=112,
+        include_sparse_corner=has_sparse,
+        sparse_corner_quanta=0.008,
+        n_bragg_spots=50,
+        n_zingers=10,
+    )
+    sim = simulate_rotation_scan(det_cfg, scene, seed=29)
+    rep = estimate_detector_statistics(sim.images, pedestal=det_cfg.pedestal)
+
+    assert np.isclose(rep.g_gamma, det_cfg.g_gamma, rtol=0.06)
+    assert np.isclose(rep.psi, det_cfg.pixel_factor, atol=max(0.35, 0.06 * det_cfg.pixel_factor))
+    if has_sparse:
+        assert rep.separation.separated is True
+        assert np.isclose(rep.gain, det_cfg.gain, rtol=0.05)
+        assert np.isclose(rep.cascade_factor, det_cfg.cascade_factor, rtol=0.06)
+
+
+def test_crowded_bragg_spots_and_zingers() -> None:
+    """Verify parameter recovery under high Bragg spot and cosmic-ray zinger crowding."""
+    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
+    scene = SceneConfig(
+        n_frames=50,
+        height=112,
+        width=112,
+        n_bragg_spots=350,
+        n_zingers=40,
+        n_hot_pixels=12,
+        n_dead_pixels=12,
+        shadow_margin_px=4,
+    )
+    sim = simulate_rotation_scan(det, scene, seed=42)
+    rep = estimate_detector_statistics(sim.images, pedestal=det.pedestal)
+
+    assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.06)
+    assert np.isclose(rep.psi, det.pixel_factor, atol=0.50)
+    assert rep.psf_radius >= 3
+
+
+def test_narrow_background_dynamic_range() -> None:
+    """Verify parameter recovery when the spatial background dynamic range is narrow."""
+    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
+    scene = SceneConfig(
+        n_frames=50,
+        height=112,
+        width=112,
+        bg_min_quanta=20.0,
+        bg_max_quanta=28.0,
+        n_bragg_spots=50,
+    )
+    sim = simulate_rotation_scan(det, scene, seed=42)
+    rep = estimate_detector_statistics(sim.images, pedestal=det.pedestal)
+
+    assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.06)
+    assert np.isclose(rep.psi, det.pixel_factor, atol=0.60)
+
+
+def test_adc_integer_quantization() -> None:
+    """Verify that integer ADC quantization does not bias (G*gamma, psi) recovery."""
+    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
+    det.quantize = True
+    scene = SceneConfig(n_frames=50, height=112, width=112, n_bragg_spots=60)
+    sim = simulate_rotation_scan(det, scene, seed=42)
+    rep = estimate_detector_statistics(sim.images, pedestal=det.pedestal)
+
+    assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.05)
+    assert np.isclose(rep.psi, det.pixel_factor, atol=0.45)
+
+
+@pytest.mark.parametrize("pedestal_error_adu", [-5.0, +5.0])
+def test_pedestal_offset_self_calibration(pedestal_error_adu: float) -> None:
+    """Verify that off-diagonal PSF covariance self-calibrates additive pedestal errors."""
+    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
+    scene = SceneConfig(n_frames=50, height=112, width=112, n_bragg_spots=60)
+    sim = simulate_rotation_scan(det, scene, seed=42)
+
+    rep = estimate_detector_statistics(
+        sim.images, pedestal=det.pedestal + pedestal_error_adu
+    )
+    assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.05)
+    assert np.isclose(rep.psi, det.pixel_factor, atol=0.70)
+

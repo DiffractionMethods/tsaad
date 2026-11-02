@@ -8,8 +8,10 @@ by summing empirical spatial cross-covariances across intensity bins.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 
 import numpy as np
+from scipy.ndimage import binary_dilation, gaussian_filter, median_filter
 
 from detector_stats.trend import TrendResult
 
@@ -44,7 +46,10 @@ def _irls_linear_fit(
 
     Returns (slope, intercept, slope_se, intercept_se, weights).
     """
-    w = counts.astype(np.float64) / np.maximum(y**2, 1.0)
+    scale0 = np.maximum(np.abs(y), 0.05 * float(np.mean(np.abs(y))) + 1e-3) / np.sqrt(
+        np.maximum(counts, 1.0)
+    )
+    w = 1.0 / (scale0**2)
     w /= np.mean(w)
 
     slope = 1.0
@@ -65,12 +70,15 @@ def _irls_linear_fit(
             slope = float(np.sum(w * x * y) / np.maximum(np.sum(w * x * x), 1e-12))
 
         pred = np.maximum(slope * x + intercept, 1e-3)
-        res = y - pred
-        mad = 1.4826 * float(np.median(np.abs(res - np.median(res)))) + 1e-6
-        # Huber robustness weight * theoretical inverse variance weight N_b / pred^2
-        u = np.abs(res) / (2.5 * mad)
+        scale = np.maximum(pred, 0.05 * float(np.mean(pred)) + 1e-3) / np.sqrt(
+            np.maximum(counts, 1.0)
+        )
+        std_res = (y - pred) / scale
+        mad = 1.4826 * float(np.median(np.abs(std_res - np.median(std_res)))) + 1e-6
+        # Standardized Huber robustness weight * inverse variance weight 1 / scale^2
+        u = np.abs(std_res) / (3.0 * mad)
         huber = np.where(u <= 1.0, 1.0, 1.0 / u)
-        w = huber * counts.astype(np.float64) / (pred**2)
+        w = huber / (scale**2)
         w /= float(np.mean(w))
 
     # Compute standard errors of slope and intercept
@@ -112,32 +120,72 @@ def estimate_lagged_covariance(
     """
     residuals = trend_result.residuals
     expected = trend_result.expected_intensity
-    valid = trend_result.valid_mask
+    valid = trend_result.valid_mask.copy()
     n_t, height, width = residuals.shape
 
+    # Post-detrending outlier safety gate: excise any surviving >6.0*sigma residual spike
+    # (computing MAD strictly over valid unmasked frames so masked zeros never bias the scale)
+    abs_res_nan = np.where(valid, np.abs(residuals), np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        res_mad_2d = 1.4826 * np.nanmedian(abs_res_nan, axis=0)
+        fallback_mad = (
+            float(np.nanmedian(res_mad_2d)) if np.any(np.isfinite(res_mad_2d)) else 1.0
+        )
+    res_mad_2d = np.nan_to_num(res_mad_2d, nan=fallback_mad)
+    res_scale_3d = np.maximum(
+        median_filter(res_mad_2d, size=7, mode="nearest")[None, :, :],
+        np.sqrt(np.maximum(expected, 1.5)),
+    )
+    spike_mask = valid & (np.abs(residuals) > 6.0 * res_scale_3d) & (np.abs(residuals) > 6.0)
+    if np.any(spike_mask):
+        spike_dilated = binary_dilation(spike_mask, structure=np.ones((1, 5, 5), dtype=bool))
+        valid &= ~spike_dilated
+
     L = min(max(1, int(max_lag)), min(height, width) // 4 - 1)
+    # Build a spatially smoothed copy of expected intensity via normalized 2D convolution
+    # strictly for conditioning-free quantile bin assignment, while keeping unblurred
+    # expected intensity for unbiased bin means.
+    valid_2d = np.any(valid, axis=0).astype(np.float64)
+    mean_exp_2d = np.where(
+        valid_2d > 0,
+        np.sum(np.where(valid, expected, 0.0), axis=0) / np.maximum(np.sum(valid, axis=0), 1),
+        0.0,
+    )
+    smooth_num = gaussian_filter(mean_exp_2d * valid_2d, sigma=1.2, mode="nearest")
+    smooth_den = gaussian_filter(valid_2d, sigma=1.2, mode="nearest")
+    smooth_2d = np.where(smooth_den > 1e-6, smooth_num / np.maximum(smooth_den, 1e-6), mean_exp_2d)
+    frame_scale = np.where(
+        mean_exp_2d[None, :, :] > 1e-6,
+        expected / np.maximum(mean_exp_2d[None, :, :], 1e-6),
+        1.0,
+    )
+    bin_field = frame_scale * smooth_2d[None, :, :]
+
     # Restrict center pixels to interior [L : H-L, L : W-L] so all shifted lags stay in-bounds
     core_valid = valid[:, L : height - L, L : width - L]
     core_exp = expected[:, L : height - L, L : width - L]
+    core_bin_field = bin_field[:, L : height - L, L : width - L]
     core_res = residuals[:, L : height - L, L : width - L]
 
     # Filter out ultra-sparse pixels (mu < 0.5 ADU) when forming intensity bins for continuous regression
-    active_core = core_valid & (core_exp >= 0.5)
+    active_core = core_valid & (core_bin_field >= 0.5)
     if np.count_nonzero(active_core) < 500:
-        active_core = core_valid & (core_exp > 0.0)
+        active_core = core_valid & (core_bin_field > 0.0)
 
-    valid_mu = core_exp[active_core]
+    valid_mu = core_bin_field[active_core]
     if valid_mu.size == 0:
         raise ValueError("No valid background pixels available for covariance estimation.")
 
-    # Define quantile bin edges across the intensity distribution
+    # Define quantile bin edges across the smoothed intensity distribution
     quantiles = np.linspace(0.0, 100.0, n_bins + 1)
     edges = np.percentile(valid_mu, quantiles)
     edges[0] -= 1e-6
     edges[-1] += 1e-6
 
-    # Assign each core voxel to a bin 0..B-1 (-1 if invalid)
-    bin_idx = np.digitize(core_exp, edges) - 1
+    # Assign each core voxel to a bin 0..B-1 (-1 if invalid) using smoothed bin_field,
+    # while accumulating unblurred core_exp for unbiased bin_means.
+    bin_idx = np.digitize(core_bin_field, edges) - 1
     bin_idx = np.where(active_core & (bin_idx >= 0) & (bin_idx < n_bins), bin_idx, -1)
     flat_bins = bin_idx.ravel()
     valid_flat_mask = flat_bins >= 0
@@ -185,6 +233,34 @@ def estimate_lagged_covariance(
     bin_counts_use = bin_counts[non_empty]
     bin_cov_use = raw_bin_cov[non_empty]
 
+    yy, xx = np.mgrid[-L : L + 1, -L : L + 1]
+    r_inf_grid = np.maximum(np.abs(yy), np.abs(xx))
+    r_euc_grid = np.hypot(yy, xx)
+
+    # Self-calibrate any additive pedestal error delta_p0 using off-diagonal ring 1 (r == 1),
+    # where uncorrelated electronic readout noise psi is strictly zero: C_ring1(mu) = S_1 * (mu + delta_p0).
+    low_q_res = core_res[core_valid & (core_exp <= np.percentile(valid_mu, 10.0))]
+    has_zero_noise_floor = low_q_res.size > 0 and float(np.median(low_q_res**2)) < 0.05
+    if (
+        not has_zero_noise_floor
+        and float(np.std(bin_means)) > 0.32 * float(np.mean(bin_means))
+        and float(np.min(bin_means)) > 1.5
+    ):
+        ring1_mask = (r_inf_grid == 1) & (r_euc_grid <= 1.45)
+        outer_mask = r_inf_grid == L
+        n_r1 = int(np.count_nonzero(ring1_mask))
+        n_out = max(1, int(np.count_nonzero(outer_mask)))
+        c_ring1 = np.sum(bin_cov_use[:, ring1_mask], axis=1) - (n_r1 / n_out) * np.sum(
+            bin_cov_use[:, outer_mask], axis=1
+        )
+        s1, i1, s1_se, i1_se, _ = _irls_linear_fit(
+            bin_means, c_ring1, bin_counts_use, clamp_nonnegative_intercept=False
+        )
+        if s1 > max(5.0 * s1_se, 0.15) and abs(i1) > 5.0 * i1_se and abs(i1 / s1) > 2.0:
+            delta_p0 = float(np.clip(i1 / s1, -0.8 * float(np.min(bin_means)), 50.0))
+            if float(np.min(bin_means)) + delta_p0 > 0.5:
+                bin_means = np.maximum(bin_means + delta_p0, 0.05)
+
     # 1. Fit zero-lag Photon Transfer Curve: C(0; mu_b) = g(0) * mu_b + psi
     # Electronic readout noise psi is localized at lag (0, 0), so fitting psi at lag (0, 0)
     # achieves (2R+1)^2 times lower variance than fitting a free intercept to summed lags.
@@ -194,8 +270,7 @@ def estimate_lagged_covariance(
     )
     # If the fitted intercept is statistically indistinguishable from 0 (within 1.5*SE)
     # and the lowest-intensity pixels show zero baseline noise floor, set psi = 0.0.
-    low_q_res = core_res[core_valid & (core_exp <= np.percentile(valid_mu, 10.0))]
-    if psi < 1.5 * psi_se and low_q_res.size > 0 and float(np.median(low_q_res**2)) < 0.05:
+    if psi < 1.5 * psi_se and has_zero_noise_floor:
         psi = 0.0
         g0 = float(np.sum(weights * bin_means * c0_bins)) / max(
             float(np.sum(weights * (bin_means**2))), 1e-12

@@ -157,9 +157,8 @@ class HollowStencilKrigingTrend:
             0.0,
         )
 
-        # Smooth expected intensity in space and time for conditioning-free intensity binning
-        smooth_template = gaussian_filter(template_2d, sigma=1.2, mode="nearest")
-        binning_intensity = flux[:, None, None] * np.maximum(smooth_template[None, :, :], 0.0)
+        # Unblurred expected intensity from temporal template and global flux
+        binning_intensity = flux[:, None, None] * np.maximum(template_2d[None, :, :], 0.0)
 
         return TrendResult(
             residuals=residuals,
@@ -240,8 +239,7 @@ class LowRankSplineTrend:
             0.0,
         )
 
-        smooth_template = gaussian_filter(template_2d, sigma=1.2, mode="nearest")
-        binning_intensity = flux[:, None, None] * np.maximum(smooth_template[None, :, :], 0.0)
+        binning_intensity = flux[:, None, None] * np.maximum(template_2d[None, :, :], 0.0)
 
         return TrendResult(
             residuals=residuals,
@@ -278,7 +276,6 @@ class TemporalDifferenceEstimator:
             raise ValueError(f"Need more than {lag} frames for temporal differencing.")
 
         flux, template_2d = estimate_incident_flux_scale(y_sub, valid_mask)
-        smooth_template = gaussian_filter(template_2d, sigma=1.2, mode="nearest")
 
         i1 = flux[:-lag, None, None]
         i2 = flux[lag:, None, None]
@@ -290,7 +287,7 @@ class TemporalDifferenceEstimator:
         diffs = np.where(pair_valid, (i1 * y2 - i2 * y1) / norm_denom, 0.0)
 
         eff_scale = (i1 * i2 * (i1 + i2)) / (i1**2 + i2**2)
-        expected_eff = eff_scale * np.maximum(smooth_template[None, :, :], 0.0)
+        expected_eff = eff_scale * np.maximum(template_2d[None, :, :], 0.0)
 
         return TrendResult(
             residuals=diffs,
