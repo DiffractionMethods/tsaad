@@ -120,6 +120,7 @@ def test_dials_dispersion_threshold_underestimates_gain_under_psf() -> None:
     """Demonstrate that DIALS's local spatial index-of-dispersion underestimates G*gamma
     by the zero-lag PSF factor S_2 = sum K(u)^2 when point-spread is present.
     """
+    pytest.importorskip("dials.algorithms.image.threshold")
     from dials.algorithms.image.threshold import DispersionThresholdDebug
     from scitbx.array_family import flex
 
