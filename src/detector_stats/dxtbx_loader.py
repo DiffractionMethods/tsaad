@@ -124,12 +124,15 @@ def select_default_roi_bbox(
     else:
         cy, cx = 0.5 * panel_height, 0.5 * panel_width
 
-    # Offset the tile center slightly from the beam center toward the largest quadrant
-    # so the tile captures the radial intensity gradient without sitting squarely on the beamstop
+    # Offset the tile from the beam center into the largest quadrant so the tile starts
+    # outside the central beamstop shadow (~0.06 * panel_dim from the beam center) and
+    # extends radially across the solvent ring toward the outer low-flux region.
     dir_y = 1.0 if (panel_height - cy) >= cy else -1.0
     dir_x = 1.0 if (panel_width - cx) >= cx else -1.0
-    target_cy = cy + dir_y * 0.35 * th
-    target_cx = cx + dir_x * 0.35 * tw
+    clearance_y = max(32.0, 0.06 * panel_height)
+    clearance_x = max(32.0, 0.06 * panel_width)
+    target_cy = cy + dir_y * (clearance_y + 0.5 * th)
+    target_cx = cx + dir_x * (clearance_x + 0.5 * tw)
 
     y0 = int(np.clip(np.rint(target_cy - 0.5 * th), 0, panel_height - th))
     x0 = int(np.clip(np.rint(target_cx - 0.5 * tw), 0, panel_width - tw))

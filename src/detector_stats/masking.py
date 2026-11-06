@@ -13,6 +13,7 @@ import numpy as np
 from scipy.ndimage import (
     binary_dilation,
     binary_propagation,
+    label,
     median_filter,
     uniform_filter,
 )
@@ -26,6 +27,8 @@ class MaskingConfig:
     hot_pixel_spatial_sigma: float = 8.0
     dead_pixel_rel_threshold: float = 0.08
     shadow_rel_threshold: float = 0.05
+    shadow_penumbra_dilation_px: int = 8
+    shadow_penumbra_rel_level: float = 0.72
     # Sliding-window temporal outlier detection (Bragg spots & zingers)
     temporal_window: int = 21
     transient_seed_sigma: float = 5.0
@@ -189,6 +192,47 @@ def detect_static_bad_pixels(
                 shadow_mask[:, c] = True
             else:
                 break
+
+    # 4. Interior beamstop / arm shadow and soft penumbra dilation:
+    # A genuine interior shadow (as opposed to a low-flux sparse corner where Poisson hits
+    # still occur across the scan) either has near-zero temporal variance (dead_mask) or
+    # stays dark across all frames when the background is everywhere high (min_2d_ref > 5 ADU).
+    low_5_pct = float(np.percentile(temp_mean[~shadow_mask], 5.0)) if np.any(~shadow_mask) else 0.0
+    has_high_background_floor = low_5_pct > 2.0
+    raw_shadow_candidates = (dead_mask & (~shadow_mask)) | (
+        has_high_background_floor
+        & (global_ref > 15.0)
+        & (temp_mean <= config.shadow_rel_threshold * global_ref)
+        & (~shadow_mask)
+    )
+    if np.any(raw_shadow_candidates) and config.shadow_penumbra_dilation_px > 0:
+        labeled_sh, n_sh = label(raw_shadow_candidates)
+        interior_shadow_core = np.zeros_like(shadow_mask)
+        for comp_id in range(1, n_sh + 1):
+            comp = labeled_sh == comp_id
+            if np.count_nonzero(comp) >= 25:
+                interior_shadow_core |= comp
+
+        if np.any(interior_shadow_core):
+            r_pen = int(config.shadow_penumbra_dilation_px)
+            yy, xx = np.mgrid[-r_pen : r_pen + 1, -r_pen : r_pen + 1]
+            disk_pen = (yy * yy + xx * xx) <= (r_pen + 0.35) ** 2
+            dilated_zone = binary_dilation(interior_shadow_core, structure=disk_pen)
+            # Compare against local broad background outside the shadow
+            valid_outside = ~(shadow_mask | interior_shadow_core)
+            ref_level = (
+                float(np.percentile(temp_mean[valid_outside], 65.0))
+                if np.any(valid_outside)
+                else global_ref
+            )
+            gx = uniform_filter(np.abs(np.gradient(temp_mean, axis=1)), size=3, mode="nearest")
+            gy = uniform_filter(np.abs(np.gradient(temp_mean, axis=0)), size=3, mode="nearest")
+            grad_mag = np.hypot(gx, gy)
+            penumbra_mask = dilated_zone & (
+                (temp_mean < config.shadow_penumbra_rel_level * ref_level)
+                | (grad_mag > 0.04 * max(ref_level, 1.0))
+            )
+            shadow_mask |= interior_shadow_core | penumbra_mask
 
     return hot_mask | dead_mask | shadow_mask
 

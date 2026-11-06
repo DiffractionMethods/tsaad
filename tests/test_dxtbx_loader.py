@@ -88,3 +88,24 @@ def test_estimate_from_dxtbx_memreader_imageset() -> None:
     assert np.isclose(rep.g_gamma, det_cfg.g_gamma, rtol=0.08)
     assert np.isclose(rep.psi, det_cfg.pixel_factor, atol=0.80)
     assert rep.psf_radius >= 2
+
+
+def test_beamstop_shadow_penumbra_dilation() -> None:
+    """Verify that an interior circular beamstop shadow with a soft penumbra is dilated."""
+    from detector_stats import detect_static_bad_pixels
+
+    det_cfg = DetectorConfig.pt_ccd_waterman_evans(pedestal=40.0, psf_radius=3)
+    scene_cfg = SceneConfig(n_frames=30, height=96, width=96, n_bragg_spots=20, shadow_margin_px=0)
+    sim = simulate_rotation_scan(det_cfg, scene_cfg, seed=7)
+
+    # Inject a synthetic circular beamstop shadow (radius 10 px) with a 4-px soft penumbra
+    y, x = np.mgrid[0:96, 0:96]
+    r_bs = np.hypot(y - 48.0, x - 48.0)
+    atten = np.clip((r_bs - 10.0) / 4.0, 0.0, 1.0)
+    imgs = det_cfg.pedestal + (sim.images - det_cfg.pedestal) * atten[None, :, :]
+
+    static_mask = detect_static_bad_pixels(imgs, pedestal=det_cfg.pedestal)
+    # Both the core (r <= 10) and the inner penumbra (10 < r <= 12.5) must be masked
+    assert np.all(static_mask[r_bs <= 10.0])
+    assert np.mean(static_mask[(r_bs > 10.0) & (r_bs <= 12.5)]) > 0.85
+
