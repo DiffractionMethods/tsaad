@@ -144,6 +144,7 @@ from detector_stats import (
     DetectorConfig,
     SceneConfig,
     estimate_detector_statistics,
+    plot_detector_stats_report,
     simulate_rotation_scan,
 )
 
@@ -164,6 +165,15 @@ print(f"Estimated gain G    : {report.gain:.3f} (method: {report.separation.sepa
 print(f"Estimated cascade γ : {report.cascade_factor:.3f}")
 print(f"Estimated noise ψ   : {report.psi:.3f} +- {report.covariance.psi_se:.3f}")
 print(f"Detected PSF radius : {report.psf_radius} px (S_2 = {report.s2_factor:.3f})")
+
+# Save an 8-panel diagnostic summary figure
+plot_detector_stats_report(
+    report,
+    output_path="diagnostic_report.png",
+    title="3D ED Timepix Rotation Scan",
+    true_detector=det,
+    true_flux=sim.incident_flux_scale,
+)
 ```
 
 ---

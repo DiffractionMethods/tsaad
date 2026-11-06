@@ -33,6 +33,8 @@ class CovarianceResult:
     bin_means: np.ndarray  # (B,) mean expected intensity mu_b in each bin
     bin_counts: np.ndarray  # (B,) number of valid observations in each bin
     bin_covariances: np.ndarray  # (B, 2*L+1, 2*L+1) empirical covariance C(u; mu_b)
+    cumulative_g_gamma_se_by_radius: np.ndarray | None = None  # (L+1,) SE of cumulative slope S(R)
+    bg_baseline_per_lag: float = 0.0  # subtracted outer-ring baseline slope per lag pixel
 
 
 def _irls_linear_fit(
@@ -308,12 +310,14 @@ def estimate_lagged_covariance(
     lag_slope_corr = lag_slope_map - bg_baseline_per_lag
 
     cumulative_slopes = np.zeros(L + 1, dtype=np.float64)
+    cumulative_ses = np.zeros(L + 1, dtype=np.float64)
     shell_slopes = np.zeros(L + 1, dtype=np.float64)
     shell_ses = np.zeros(L + 1, dtype=np.float64)
     shell_mean_per_px = np.zeros(L + 1, dtype=np.float64)
 
     g0_corr = float(lag_slope_corr[L, L])
     cumulative_slopes[0] = g0_corr
+    cumulative_ses[0] = g0_se
     shell_slopes[0] = g0_corr
     shell_ses[0] = g0_se
     shell_mean_per_px[0] = g0_corr
@@ -339,6 +343,17 @@ def estimate_lagged_covariance(
         shell_ses[r] = se_ring
         shell_mean_per_px[r] = s_ring / float(n_ring_px)
         cumulative_slopes[r] = cumulative_slopes[r - 1] + s_ring
+
+        # Standard error on cumulative disk slope S(r)
+        n_disk_px = int(np.count_nonzero(disk_mask))
+        disk_cov_minus_psi = (
+            np.sum(bin_cov_use[:, disk_mask], axis=1)
+            - psi
+            - n_disk_px * bg_baseline_per_lag * bin_means
+        )
+        res_disk = disk_cov_minus_psi - cumulative_slopes[r] * bin_means
+        s2_disk = float(np.sum(weights * res_disk * res_disk)) / dof_1p
+        cumulative_ses[r] = float(np.sqrt(s2_disk / max(denom_mu2, 1e-12)))
 
     if fixed_psf_radius is not None:
         r_psf = int(np.clip(fixed_psf_radius, 0, L))
@@ -396,4 +411,6 @@ def estimate_lagged_covariance(
         bin_means=bin_means,
         bin_counts=bin_counts_use,
         bin_covariances=bin_cov_use,
+        cumulative_g_gamma_se_by_radius=cumulative_ses,
+        bg_baseline_per_lag=bg_baseline_per_lag,
     )

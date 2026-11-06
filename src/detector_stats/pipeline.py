@@ -26,6 +26,9 @@ class DetectorStatsReport:
     covariance: CovarianceResult
     trend: TrendResult
     masking: MaskingResult
+    representative_frame_idx: int = 0
+    representative_frame_adu: np.ndarray | None = None  # (H, W) pedestal-subtracted raw frame t_0
+    scan_peak_projection_adu: np.ndarray | None = None  # (H, W) temporal max projection over unmasked static pixels
 
     @property
     def gain(self) -> float:
@@ -112,9 +115,18 @@ def estimate_detector_statistics(
         static_bad_mask=mask_res.static_bad_mask,
     )
 
+    y_sub = np.asarray(images, dtype=np.float64) - float(pedestal)
+    t0 = int(np.argmax(np.sum(mask_res.transient_outlier_mask, axis=(1, 2))))
+    rep_frame = y_sub[t0].copy()
+    y_no_static = np.where(mask_res.static_bad_mask[None, :, :], 0.0, y_sub)
+    peak_proj = np.max(y_no_static, axis=0)
+
     return DetectorStatsReport(
         separation=sep_res,
         covariance=cov_res,
         trend=trend_res,
         masking=mask_res,
+        representative_frame_idx=t0,
+        representative_frame_adu=rep_frame,
+        scan_peak_projection_adu=peak_proj,
     )

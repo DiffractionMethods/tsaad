@@ -38,6 +38,8 @@ class SeparationResult:
     n_isolated_clusters: int = 0
     sparse_gamma_direct: float | None = None
     cumulant_g_estimate: float | None = None
+    cluster_sums: np.ndarray | None = None
+    cluster_areas: np.ndarray | None = None
 
 
 def estimate_sparse_cluster_multiplicity(
@@ -211,6 +213,8 @@ def estimate_sparse_cluster_multiplicity(
         separation_method="sparse_cluster_multiplicity",
         n_isolated_clusters=n_clusters,
         sparse_gamma_direct=float(gamma_sparse),
+        cluster_sums=sums_arr,
+        cluster_areas=areas_arr,
     )
 
 

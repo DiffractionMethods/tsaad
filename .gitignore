@@ -1,9 +1,3 @@
-# Local DIALS installation and reference papers
-/dials/
-/papers/
-/.licenses/
-/implementation_plan.pdf
-
 # Python build & test artifacts
 __pycache__/
 *.py[cod]
