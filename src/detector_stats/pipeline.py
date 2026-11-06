@@ -8,7 +8,12 @@ from typing import Literal
 import numpy as np
 
 from detector_stats.covariance import CovarianceResult, estimate_lagged_covariance
-from detector_stats.masking import MaskingConfig, MaskingResult, detect_transient_outliers
+from detector_stats.masking import (
+    MaskingConfig,
+    MaskingResult,
+    detect_static_bad_pixels,
+    detect_transient_outliers,
+)
 from detector_stats.separation import SeparationResult, separate_gain_and_cascade
 from detector_stats.trend import (
     HollowStencilKrigingTrend,
@@ -64,6 +69,7 @@ def estimate_detector_statistics(
     max_lag: int = 7,
     n_bins: int = 12,
     masking_config: MaskingConfig | None = None,
+    external_static_bad_mask: np.ndarray | None = None,
 ) -> DetectorStatsReport:
     """Estimate detector response statistics (G, gamma, psi) from a rotation-scan image stack.
 
@@ -81,14 +87,25 @@ def estimate_detector_statistics(
         Number of intensity quantile bins B.
     masking_config : MaskingConfig, optional
         Custom anomaly masking thresholds.
+    external_static_bad_mask : np.ndarray, optional
+        Additional 2D boolean mask (H, W) of untrusted/masked pixels (e.g. from dxtbx).
 
     Returns
     -------
     DetectorStatsReport
         Full report containing masking, trend, lagged covariance, and (G, gamma, psi) estimates.
     """
-    mask_res = detect_transient_outliers(
+    static_mask = detect_static_bad_pixels(
         images, pedestal=pedestal, config=masking_config
+    )
+    if external_static_bad_mask is not None:
+        static_mask = static_mask | np.asarray(external_static_bad_mask, dtype=bool)
+
+    mask_res = detect_transient_outliers(
+        images,
+        pedestal=pedestal,
+        static_bad_mask=static_mask,
+        config=masking_config,
     )
 
     if trend_method == "hollow_stencil_kriging":
