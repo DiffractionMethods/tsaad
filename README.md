@@ -14,12 +14,14 @@ Local single-frame dispersion estimators (such as `dials.estimate_gain`) underes
 
 ---
 
-## Environment & Installation
+## Environment, Architecture & Long-Term Packaging
 
-### Standard Python vs. DIALS Python
+### Standalone Design (No Dependency on DIALS)
 
-- **Standard Python ($\ge 3.10$):** The core `detector_stats` package (including the synthetic rotation-scan simulator and statistical estimators) is pure Python and depends **only on `numpy` and `scipy`**. You can run it in any standard Python virtual environment or conda environment without DIALS installed.
-- **DIALS Python (`dials.python` / DIALS `conda_base`):** Recommended if you want to run the DIALS comparison tests (e.g., comparing against `dials.algorithms.image.threshold.DispersionThresholdDebug` used by `dials.estimate_gain`) or load experimental diffraction datasets via `dxtbx`. If DIALS is not present in your environment, DIALS-specific tests are automatically skipped by `pytest`.
+`detector_stats` is designed as a **standalone package independent of DIALS** so that users and external pipelines without a full DIALS installation can install and use it directly:
+- **Core package (`detector_stats`):** Pure Python, depending **only on `numpy` and `scipy`** (with `matplotlib` for diagnostic plotting).
+- **`dxtbx` integration (`detector_stats.dxtbx_loader`):** Optionally depends on `dxtbx` to read diffraction image formats, `.expt` files, `ImageSet`s, and detector `Panel` models, and replicates the single-frame Kabsch local dispersion baseline (`dials.estimate_gain`) in pure NumPy without importing `dials`.
+- **Future `conda-forge` & DIALS Integration:** Because `detector_stats` depends only on `numpy`, `scipy`, `matplotlib`, and (optionally) `dxtbx`—and never on `dials`—it can be packaged on `conda-forge` without circular dependencies. Downstream DIALS builds can then install `detector-stats` from `conda-forge` and import it directly inside a replacement implementation of `dials.estimate_gain`.
 
 ### Installing into a Standard Python Environment
 

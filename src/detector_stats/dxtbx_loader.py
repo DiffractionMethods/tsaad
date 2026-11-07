@@ -139,36 +139,56 @@ def select_default_roi_bbox(
     return (y0, y0 + th, x0, x0 + tw)
 
 
+def _box_sum_2d(arr: np.ndarray, ky: int, kx: int) -> np.ndarray:
+    """Fast 2D summed-area-table box sum over `[r - ky, r + ky] x [c - kx, c + kx]`."""
+    h, w = arr.shape
+    sat = np.pad(arr, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    rows = np.arange(h)
+    cols = np.arange(w)
+    r0 = np.maximum(0, rows - ky)[:, None]
+    r1 = np.minimum(h, rows + ky + 1)[:, None]
+    c0 = np.maximum(0, cols - kx)[None, :]
+    c1 = np.minimum(w, cols + kx + 1)[None, :]
+    return sat[r1, c1] - sat[r0, c1] - sat[r1, c0] + sat[r0, c0]
+
+
 def compute_dials_dispersion_gain_on_tile(
     images: np.ndarray,
     untrusted_mask: np.ndarray,
     kernel_size: tuple[int, int] = (10, 10),
     max_frames: int = 10,
 ) -> np.ndarray:
-    """Run DIALS's DispersionThresholdDebug on up to `max_frames` of a tile stack.
+    """Compute the single-frame Kabsch local index-of-dispersion gain on up to `max_frames`.
 
-    Replicates the exact IQR-filtered median index-of-dispersion calculation in
-    `dials.command_line.estimate_gain`.
+    Replicates the exact summed-area-table `IndexOfDispersionFilterMasked` and IQR-filtered
+    median calculation used by `dials.estimate_gain` in pure NumPy (without requiring
+    `dials` to be installed).
     """
-    from dials.algorithms.image.threshold import DispersionThresholdDebug
-    from scitbx.array_family import flex
-
     n_frames, height, width = images.shape
+    ky, kx = max(1, int(kernel_size[0])), max(1, int(kernel_size[1]))
+    min_count = (2 * ky + 1) * (2 * kx + 1)
+
     step = max(1, n_frames // max(1, int(max_frames)))
     sample_indices = range(0, n_frames, step)[: max(1, int(max_frames))]
 
-    valid_2d = np.ascontiguousarray(~untrusted_mask)
-    flex_mask = flex.bool(valid_2d)
-    flex_gain = flex.double(flex.grid(height, width), 1.0)
+    valid_base = ~np.asarray(untrusted_mask, dtype=bool)
+    big_limit = float(1 << 24)
 
     gains: list[float] = []
     for idx in sample_indices:
-        frame_f64 = np.ascontiguousarray(images[idx], dtype=np.float64)
-        flex_img = flex.double(frame_f64)
-        debug = DispersionThresholdDebug(
-            flex_img, flex_mask, flex_gain, kernel_size, 6.0, 3.0, 0.0, 0
+        frame = np.asarray(images[idx], dtype=np.float64)
+        mask = valid_base & (frame < big_limit)
+        m = _box_sum_2d(mask.astype(np.float64), ky, kx)
+        x = _box_sum_2d(np.where(mask, frame, 0.0), ky, kx)
+        y = _box_sum_2d(np.where(mask, frame * frame, 0.0), ky, kx)
+
+        disp_map = np.ones((height, width), dtype=np.float64)
+        valid_px = mask & (m >= min_count) & (x > 0.0)
+        disp_map[valid_px] = (m[valid_px] * y[valid_px] - x[valid_px] ** 2) / (
+            (m[valid_px] - 1.0) * x[valid_px]
         )
-        disp = debug.index_of_dispersion().as_numpy_array().ravel()
+
+        disp = disp_map.ravel()
         disp = disp[np.isfinite(disp) & (disp > 0.0)]
         if disp.size < 10:
             continue
