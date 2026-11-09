@@ -78,11 +78,44 @@ def estimate_rough_frame_flux(
         in_range = vals[(vals >= q10) & (vals <= q80)]
         flux[t_idx] = float(np.mean(in_range)) if in_range.size > 0 else float(np.mean(vals))
 
-    flux = np.clip(flux, 1e-6, None)
+    ref_flux = max(float(np.mean(np.abs(flux))), 1e-30)
+    flux = np.clip(flux / ref_flux, 1e-6, None)
     mean_flux = float(np.mean(flux))
     if mean_flux > 0:
         flux /= mean_flux
     return flux
+
+
+def _estimate_quantum_scale_adu(
+    y_sub: np.ndarray,
+    temp_median: np.ndarray,
+    diff_var: np.ndarray,
+) -> float:
+    """Estimate a scale-covariant single-pixel quantum ADU unit `q_scale` (homogeneous of degree 1).
+
+    Under any multiplicative rescaling `y_sub -> c * y_sub` (c > 0), `diff_var` scales as c^2
+    and `temp_median` scales as c, so `q_scale` scales strictly as c^1. For standard unit-gain
+    detectors, `q_scale ~= 1.0 ADU`.
+    """
+    pos_thresh = float(np.percentile(temp_median, 20.0))
+    pos_mask = (temp_median > max(pos_thresh, 0.0)) & np.isfinite(diff_var)
+    if np.count_nonzero(pos_mask) >= 16:
+        med_mu = float(np.median(temp_median[pos_mask]))
+        med_var = float(np.median(diff_var[pos_mask]))
+        if med_mu > 0.0 and med_var > 0.0:
+            return max(med_var / med_mu, 1e-12)
+
+    pos_all = temp_median > 0.0
+    if np.any(pos_all) and np.any(diff_var > 0.0):
+        med_mu = float(np.median(temp_median[pos_all]))
+        med_var = float(np.median(diff_var[pos_all]))
+        if med_mu > 0.0 and med_var > 0.0:
+            return max(med_var / med_mu, 1e-12)
+
+    fallback = float(np.sqrt(max(float(np.median(diff_var)), 0.0)))
+    if fallback > 0.0:
+        return fallback
+    return max(float(np.percentile(np.abs(y_sub), 75.0)), 1e-12)
 
 
 def detect_static_bad_pixels(
@@ -124,17 +157,24 @@ def detect_static_bad_pixels(
     )
     local_mean_9 = uniform_filter(temp_mean, size=9, mode="nearest")
 
-    # Estimate baseline readout noise floor from temporal differences in lowest-signal pixels
+    # Estimate baseline readout noise floor and scale-covariant quantum unit q_scale from temporal differences
     if n_frames > 1:
         diff_var = 0.5 * np.median((y_sub[1:] - y_sub[:-1]) ** 2, axis=0) / 0.4549364
         read_sigma_est = float(np.sqrt(max(np.percentile(diff_var, 5.0), 0.0)))
     else:
+        diff_var = temp_var
         read_sigma_est = 0.0
 
+    q_scale = _estimate_quantum_scale_adu(y_sub, temp_median, diff_var)
+
     # 1. Hot / flickering pixels: temporal median or temporal variance sticks out sharply
-    # above the immediate 5x5 spatial neighborhood
-    scale_floor = np.maximum(local_mad_5, np.sqrt(np.maximum(local_med_5, 1.0)))
-    hot_mask = (temp_median - local_med_5) > (config.hot_pixel_spatial_sigma * scale_floor + 10.0)
+    # above the immediate 5x5 spatial neighborhood (all thresholds homogeneous in q_scale)
+    scale_floor = np.maximum(
+        local_mad_5, np.sqrt(np.maximum(q_scale * local_med_5, q_scale**2))
+    )
+    hot_mask = (temp_median - local_med_5) > (
+        config.hot_pixel_spatial_sigma * scale_floor + 10.0 * q_scale
+    )
 
     local_var_med = median_filter(temp_var, size=5, mode="nearest")
     local_var_mad = 1.4826 * median_filter(
@@ -142,20 +182,29 @@ def detect_static_bad_pixels(
     )
     hot_var_mask = (
         (temp_var - local_var_med)
-        > config.hot_pixel_spatial_sigma * np.maximum(local_var_mad, local_var_med + 1.0)
+        > config.hot_pixel_spatial_sigma * np.maximum(local_var_mad, local_var_med + q_scale**2)
     ) & (temp_median > local_med_5 + 3.0 * scale_floor)
     hot_mask |= hot_var_mask
 
     # 2. Isolated dead pixels: zero temporal variance or signal collapsed relative to active neighborhood
-    # Require that the immediate 5x5 median is active (> 0.5 ADU) and cumulative 9x9 flux (T * local_mean > 20)
+    # Require that the immediate 5x5 median is active (> 0.5 * q_scale) and cumulative 9x9 flux (T * local_mean > 20 * q_scale)
     # so genuine zero-count pixels in sparse low-flux regions are never flagged as dead.
-    active_neighborhood = ((n_frames * local_mean_9) > 20.0) & (local_med_5 > 0.5)
+    active_neighborhood = ((n_frames * local_mean_9) > 20.0 * q_scale) & (
+        local_med_5 > 0.5 * q_scale
+    )
+    zero_var_tol = (1e-6 * q_scale) ** 2
     dead_mask = active_neighborhood & (
-        ((temp_var <= 1e-10) & ((np.abs(temp_mean) <= max(read_sigma_est, 1e-6)) | np.all(images == 0.0, axis=0)))
+        (
+            (temp_var <= zero_var_tol)
+            & (
+                (np.abs(temp_mean) <= max(read_sigma_est, 1e-6 * q_scale))
+                | np.all(np.abs(images) <= 1e-6 * q_scale, axis=0)
+            )
+        )
         | (temp_mean < config.dead_pixel_rel_threshold * local_med_5)
     )
     # Also catch pixels pinned at raw 0.0 when pedestal > 0 or local neighborhood is active
-    pinned_zero = np.all(np.abs(images) <= 1e-10, axis=0) & active_neighborhood
+    pinned_zero = np.all(np.abs(images) <= 1e-6 * q_scale, axis=0) & active_neighborhood
     dead_mask |= pinned_zero
 
     # 3. Shadowed border strips around the perimeter (where an entire edge row/col receives zero flux,
@@ -166,7 +215,7 @@ def detect_static_bad_pixels(
         0.02 * global_ref,
     )
     shadow_mask = np.zeros((height, width), dtype=bool)
-    if global_ref > 0.5:
+    if global_ref > 0.5 * q_scale:
         max_margin = min(height, width) // 4
         # Top border rows
         for r in range(max_margin):
@@ -196,12 +245,12 @@ def detect_static_bad_pixels(
     # 4. Interior beamstop / arm shadow and soft penumbra dilation:
     # A genuine interior shadow (as opposed to a low-flux sparse corner where Poisson hits
     # still occur across the scan) either has near-zero temporal variance (dead_mask) or
-    # stays dark across all frames when the background is everywhere high (min_2d_ref > 5 ADU).
+    # stays dark across all frames when the background is everywhere high.
     low_5_pct = float(np.percentile(temp_mean[~shadow_mask], 5.0)) if np.any(~shadow_mask) else 0.0
-    has_high_background_floor = low_5_pct > 2.0
+    has_high_background_floor = low_5_pct > 2.0 * q_scale
     raw_shadow_candidates = (dead_mask & (~shadow_mask)) | (
         has_high_background_floor
-        & (global_ref > 15.0)
+        & (global_ref > 15.0 * q_scale)
         & (temp_mean <= config.shadow_rel_threshold * global_ref)
         & (~shadow_mask)
     )
@@ -230,7 +279,7 @@ def detect_static_bad_pixels(
             grad_mag = np.hypot(gx, gy)
             penumbra_mask = dilated_zone & (
                 (temp_mean < config.shadow_penumbra_rel_level * ref_level)
-                | (grad_mag > 0.04 * max(ref_level, 1.0))
+                | (grad_mag > 0.04 * max(ref_level, q_scale))
             )
             shadow_mask |= interior_shadow_core | penumbra_mask
 
@@ -302,32 +351,74 @@ def detect_transient_outliers(
         mad_2d_clean = mean_mad_2d
     spatial_scale_2d = median_filter(mad_2d_clean, size=7, mode="nearest")
 
-    # Poisson/discrete floor prevents false-positive clipping in ultra-low-flux sparse corners
-    poisson_floor = np.sqrt(np.maximum(temp_med, 1.5))
+    # Estimate scale-covariant single-quantum ADU unit q_scale on y_norm
+    temp_med_2d = np.median(y_norm, axis=0)
+    if n_frames > 1:
+        diff_var_norm = 0.5 * np.median((y_norm[1:] - y_norm[:-1]) ** 2, axis=0) / 0.4549364
+    else:
+        diff_var_norm = np.var(y_norm, axis=0)
+    q_scale = _estimate_quantum_scale_adu(y_norm, temp_med_2d, diff_var_norm)
+
+    # Scale-covariant Poisson floor prevents false-positive clipping in ultra-low-flux sparse corners
+    poisson_floor = np.sqrt(np.maximum(q_scale * temp_med, 1.5 * (q_scale**2)))
     sigma_eff = np.maximum(spatial_scale_2d[None, :, :], poisson_floor)
 
     # Positive excess z-score (Bragg spots and cosmic-ray zingers are positive spikes)
-    z_pos = (y_norm - temp_med) / (sigma_eff + 1e-6)
+    z_pos = (y_norm - temp_med) / np.maximum(sigma_eff, 1e-6 * q_scale)
 
     # High-confidence single-voxel seeds (catches zingers and Bragg peak cores)
-    # Require actual excess above a minimum discrete step (> 4 ADU) to never trigger on single photons
+    # Require actual excess above a minimum discrete step (> 4 * q_scale) to never trigger on single photons
     raw_excess = y_norm - temp_med
-    seed_mask = (z_pos > config.transient_seed_sigma) & (raw_excess > 4.0)
+    seed_mask = (z_pos > config.transient_seed_sigma) & (raw_excess > 4.0 * q_scale)
 
     # Also detect locally correlated 2x2 spatial excesses for broad, moderate-intensity Bragg spots
     smooth_z = uniform_filter(z_pos, size=(1, 3, 3), mode="nearest")
-    cluster_seeds = (smooth_z > config.transient_cluster_sigma) & (z_pos > 2.2) & (raw_excess > 2.5)
+    cluster_seeds = (
+        (smooth_z > config.transient_cluster_sigma)
+        & (z_pos > 2.2)
+        & (raw_excess > 2.5 * q_scale)
+    )
     seed_mask |= cluster_seeds
 
     # Do not seed from static bad pixels
     seed_mask &= ~static_bad_mask[None, :, :]
 
-    # Bounded 3D dilation in (t, y, x) around seeds to mask Bragg reflection wings without percolation
-    if np.any(seed_mask) and (config.dilation_t > 0 or config.dilation_xy > 0):
-        st_t = 2 * max(0, config.dilation_t) + 1
-        st_xy = 2 * max(0, config.dilation_xy) + 1
-        struct = np.ones((st_t, st_xy, st_xy), dtype=bool)
-        transient_mask = binary_dilation(seed_mask, structure=struct)
+    # Bounded hysteresis propagation into contiguous Bragg spot wings (smooth_z > transient_wing_sigma)
+    # within a local halo around seeds, followed by 3D dilation in (t, y, x).
+    if np.any(seed_mask):
+        if config.dilation_t > 0 or config.dilation_xy > 0:
+            st_t = 2 * max(0, config.dilation_t) + 1
+            st_xy = 2 * max(0, config.dilation_xy) + 1
+            struct = np.ones((st_t, st_xy, st_xy), dtype=bool)
+            dilated_seeds = binary_dilation(seed_mask, structure=struct)
+        else:
+            dilated_seeds = seed_mask
+
+        if config.transient_wing_sigma > 0.0:
+            max_wing_reach = 2 * (max(1, int(config.dilation_xy)) + 2) + 1
+            wing_envelope = binary_dilation(
+                seed_mask,
+                structure=np.ones((1, max_wing_reach, max_wing_reach), dtype=bool),
+            )
+            wing_candidates = (
+                wing_envelope
+                & (smooth_z > config.transient_wing_sigma)
+                & (raw_excess > 1.5 * q_scale)
+                & (~static_bad_mask[None, :, :])
+            )
+            wing_propagated = binary_propagation(
+                seed_mask,
+                mask=wing_candidates | seed_mask,
+                structure=np.ones((1, 3, 3), dtype=bool),
+            )
+            # Add a 1-px safety rim around propagated Bragg reflection wings
+            wing_rim = binary_dilation(
+                wing_propagated ^ seed_mask,
+                structure=np.ones((1, 3, 3), dtype=bool),
+            )
+            transient_mask = dilated_seeds | wing_propagated | wing_rim
+        else:
+            transient_mask = dilated_seeds
     else:
         transient_mask = seed_mask
 

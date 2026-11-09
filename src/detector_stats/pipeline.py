@@ -70,6 +70,7 @@ def estimate_detector_statistics(
     n_bins: int = 12,
     masking_config: MaskingConfig | None = None,
     external_static_bad_mask: np.ndarray | None = None,
+    auto_calibrate_pedestal: bool = True,
 ) -> DetectorStatsReport:
     """Estimate detector response statistics (G, gamma, psi) from a rotation-scan image stack.
 
@@ -121,7 +122,10 @@ def estimate_detector_statistics(
         images, valid_mask=mask_res.valid_mask, pedestal=pedestal
     )
     cov_res = estimate_lagged_covariance(
-        trend_res, max_lag=max_lag, n_bins=n_bins
+        trend_res,
+        max_lag=max_lag,
+        n_bins=n_bins,
+        auto_calibrate_pedestal=auto_calibrate_pedestal,
     )
 
     sep_res = separate_gain_and_cascade(

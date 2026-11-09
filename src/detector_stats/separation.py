@@ -76,7 +76,8 @@ def estimate_sparse_cluster_multiplicity(
         Separated (G, gamma, psi) if sufficient isolated clusters are found, else None.
     """
     # Require low readout noise so individual quantum hits stand clearly above baseline noise
-    if np.sqrt(max(cov_result.psi, 0.0)) > 0.25 * max(cov_result.g_gamma, 1.0):
+    gg_scale = max(float(cov_result.g_gamma), 1e-12)
+    if np.sqrt(max(cov_result.psi, 0.0)) > 0.25 * gg_scale:
         return None
 
     y_sub = np.asarray(images, dtype=np.float64) - float(pedestal)
@@ -85,11 +86,11 @@ def estimate_sparse_cluster_multiplicity(
 
     # Compute 2D temporally averaged and edge-preserving spatially smoothed background rate
     p95 = np.percentile(y_sub, 95.0, axis=0)
-    y_clipped = np.minimum(y_sub, np.maximum(p95[None, :, :], 20.0 * cov_result.g_gamma))
-    mean_2d = np.where(valid_2d, np.mean(y_clipped, axis=0), 1e9)
+    y_clipped = np.minimum(y_sub, np.maximum(p95[None, :, :], 20.0 * gg_scale))
+    mean_2d = np.where(valid_2d, np.mean(y_clipped, axis=0), 1e9 * gg_scale)
     smooth_mean_2d = median_filter(mean_2d, size=5, mode="nearest")
 
-    approx_rate_2d = smooth_mean_2d / max(cov_result.g_gamma, 0.5)
+    approx_rate_2d = smooth_mean_2d / gg_scale
     sparse_2d = valid_2d & (approx_rate_2d >= 0.0) & (approx_rate_2d <= max_sparse_quanta_rate)
 
     # Exclude a 2-pixel border around the image perimeter so truncated edge clusters are ignored
@@ -106,9 +107,10 @@ def estimate_sparse_cluster_multiplicity(
     if is_integer and cov_result.psi < 1.0:
         hit_threshold = 0.5
     else:
-        hit_threshold = max(0.5, 4.0 * np.sqrt(max(cov_result.psi, 0.0)))
+        g0_scale = max(float(cov_result.apparent_single_pixel_gain), 0.1 * gg_scale)
+        hit_threshold = max(0.35 * g0_scale, 4.0 * np.sqrt(max(cov_result.psi, 0.0)))
     max_span = max(3, 2 * min(cov_result.psf_radius, 2) + 1)
-    max_single_event_adu = 12.0 * max(cov_result.g_gamma, 1.0)
+    max_single_event_adu = 12.0 * gg_scale
 
     cluster_sums: list[float] = []
     cluster_areas: list[int] = []
@@ -154,11 +156,18 @@ def estimate_sparse_cluster_multiplicity(
             if span_y > max_span or span_x > max_span:
                 continue
 
-            total_adu = float(np.sum(frame[ys, xs][comp_hits]))
-            if total_adu > max_single_event_adu:
+            if is_integer:
+                comp_support = comp_hits
+            else:
+                # For continuous PSF detectors with readout noise, integrate over the 1-px dilated
+                # cluster support inside the bounding slice so sub-threshold PSF wings are not clipped
+                comp_support = (labeled[ys, xs] == comp_idx) & sparse_2d[ys, xs]
+
+            total_adu = float(np.sum(frame[ys, xs][comp_support]))
+            if total_adu > max_single_event_adu or total_adu <= 0.0:
                 continue
 
-            area = int(np.count_nonzero(comp_hits))
+            area = int(np.count_nonzero(comp_support))
             cluster_sums.append(total_adu)
             cluster_areas.append(area)
 
@@ -226,7 +235,8 @@ def estimate_cumulant_g_exploratory(
     res = trend_result.residuals
     exp = trend_result.expected_intensity
     val = trend_result.valid_mask
-    active = val & (exp >= 1.0)
+    gg_scale = max(float(cov_result.g_gamma), 1e-12)
+    active = val & (exp >= gg_scale)
     if np.count_nonzero(active) < 5000:
         return None
     r_act = res[active]

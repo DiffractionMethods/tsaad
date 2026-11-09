@@ -42,24 +42,28 @@ def estimate_incident_flux_scale(
     n_frames, height, width = y_sub.shape
     v_float = valid_mask.astype(np.float64)
     y_masked = np.where(valid_mask, y_sub, 0.0)
+    y_abs_ref = max(float(np.mean(np.abs(y_masked))), 1e-30)
 
     counts_per_frame = np.maximum(np.sum(v_float, axis=(1, 2)), 1.0)
     flux = np.sum(y_masked, axis=(1, 2)) / counts_per_frame
-    flux = np.clip(flux, 1e-4, None)
+    flux /= max(float(np.mean(flux)), 1e-30 * y_abs_ref)
+    flux = np.clip(flux, 1e-6, None)
     flux /= float(np.mean(flux))
 
     template_2d = np.zeros((height, width), dtype=np.float64)
     for _ in range(max(1, n_iter)):
         denom_x = np.sum(v_float * flux[:, None, None], axis=0)
         num_x = np.sum(y_masked, axis=0)
-        template_2d = np.where(denom_x > 0, num_x / np.maximum(denom_x, 1e-12), 0.0)
+        template_2d = np.where(denom_x > 0, num_x / np.maximum(denom_x, 1e-30), 0.0)
 
         pos_template = np.maximum(template_2d, 0.0)
         denom_t = np.sum(v_float * pos_template[None, :, :], axis=(1, 2))
         flux_new = np.where(
-            denom_t > 0, np.sum(y_masked, axis=(1, 2)) / np.maximum(denom_t, 1e-12), flux
+            denom_t > 0,
+            np.sum(y_masked, axis=(1, 2)) / np.maximum(denom_t, 1e-30 * y_abs_ref),
+            flux,
         )
-        flux = np.clip(flux_new, 1e-4, None)
+        flux = np.clip(flux_new, 1e-6, None)
         flux /= float(np.mean(flux))
 
     return flux, np.maximum(template_2d, 0.0)
@@ -121,9 +125,13 @@ class HollowStencilKrigingTrend:
         w_raw = np.exp(-0.5 * (dt / self.temporal_sigma_frames) ** 2)
         np.fill_diagonal(w_raw, 0.0)
 
+        # Account for the exact shot-noise variance scaling Var(I_0(t)/I_0(s) * Y_s) ~ (I_0(t)/I_0(s)) * Var(Y_t)
+        flux_ratio = flux[:, None] / np.maximum(flux[None, :], 1e-12)
+        w_var_kernel = (w_raw**2) * flux_ratio
+
         num_t = np.einsum("ts,syx->tyx", w_raw, y_norm_masked)
         den_t = np.einsum("ts,syx->tyx", w_raw, v_float)
-        sum_w2 = np.einsum("ts,syx->tyx", w_raw**2, v_float)
+        sum_w2 = np.einsum("ts,syx->tyx", w_var_kernel, v_float)
 
         # Hollow-annulus spatial fallback template for pixels with no valid temporal neighbors
         hollow_kernel = _build_hollow_annulus_kernel(

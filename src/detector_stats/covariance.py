@@ -35,6 +35,8 @@ class CovarianceResult:
     bin_covariances: np.ndarray  # (B, 2*L+1, 2*L+1) empirical covariance C(u; mu_b)
     cumulative_g_gamma_se_by_radius: np.ndarray | None = None  # (L+1,) SE of cumulative slope S(R)
     bg_baseline_per_lag: float = 0.0  # subtracted outer-ring baseline slope per lag pixel
+    estimated_pedestal_offset: float = 0.0  # off-diagonal estimated additive pedestal error delta_p0 (ADU)
+    psf_converged: bool = True  # True if r_PSF < max_lag (converged inside lag window)
 
 
 def _irls_linear_fit(
@@ -47,14 +49,16 @@ def _irls_linear_fit(
     """Fit y = slope * x + intercept via Iteratively Reweighted Least Squares (IRLS).
 
     Returns (slope, intercept, slope_se, intercept_se, weights).
+    All weight floors scale homogeneously with `mean(|y|)` so the fit is strictly
+    scale-equivariant under `(x, y) -> (c * x, c^2 * y)`.
     """
-    scale0 = np.maximum(np.abs(y), 0.05 * float(np.mean(np.abs(y))) + 1e-3) / np.sqrt(
-        np.maximum(counts, 1.0)
-    )
+    y_ref = max(float(np.mean(np.abs(y))), 1e-30)
+    x_ref = max(float(np.mean(np.abs(x))), 1e-30)
+    scale0 = np.maximum(np.abs(y), 0.05 * y_ref) / np.sqrt(np.maximum(counts, 1.0))
     w = 1.0 / (scale0**2)
-    w /= np.mean(w)
+    w /= float(np.mean(w))
 
-    slope = 1.0
+    slope = y_ref / x_ref
     intercept = 0.0
     for _ in range(max(1, n_iter)):
         sw = float(np.sum(w))
@@ -63,20 +67,20 @@ def _irls_linear_fit(
         sxx = float(np.sum(w * x * x))
         sxy = float(np.sum(w * x * y))
         denom = sw * sxx - sx * sx
-        if abs(denom) < 1e-12:
+        if abs(denom) <= 1e-24 * (sxx * sw + 1e-30):
             break
         slope = (sw * sxy - sx * sy) / denom
         intercept = (sxx * sy - sx * sxy) / denom
         if clamp_nonnegative_intercept and intercept < 0.0:
             intercept = 0.0
-            slope = float(np.sum(w * x * y) / np.maximum(np.sum(w * x * x), 1e-12))
+            slope = float(np.sum(w * x * y) / max(float(np.sum(w * x * x)), 1e-30))
 
-        pred = np.maximum(slope * x + intercept, 1e-3)
-        scale = np.maximum(pred, 0.05 * float(np.mean(pred)) + 1e-3) / np.sqrt(
-            np.maximum(counts, 1.0)
-        )
-        std_res = (y - pred) / scale
-        mad = 1.4826 * float(np.median(np.abs(std_res - np.median(std_res)))) + 1e-6
+        pred_raw = slope * x + intercept
+        pred_ref = max(float(np.mean(np.abs(pred_raw))), y_ref)
+        pred = np.maximum(pred_raw, 1e-4 * pred_ref)
+        scale = np.maximum(pred, 0.05 * pred_ref) / np.sqrt(np.maximum(counts, 1.0))
+        std_res = (y - pred_raw) / scale
+        mad = 1.4826 * float(np.median(np.abs(std_res - np.median(std_res)))) + 1e-12
         # Standardized Huber robustness weight * inverse variance weight 1 / scale^2
         u = np.abs(std_res) / (3.0 * mad)
         huber = np.where(u <= 1.0, 1.0, 1.0 / u)
@@ -90,7 +94,7 @@ def _irls_linear_fit(
     sw = float(np.sum(w))
     sx = float(np.sum(w * x))
     sxx = float(np.sum(w * x * x))
-    denom = max(sw * sxx - sx * sx, 1e-12)
+    denom = max(sw * sxx - sx * sx, 1e-30)
     slope_se = float(np.sqrt(s2 * sw / denom))
     intercept_se = float(np.sqrt(s2 * sxx / denom))
     return float(slope), float(intercept), slope_se, intercept_se, w
@@ -101,6 +105,8 @@ def estimate_lagged_covariance(
     max_lag: int = 7,
     n_bins: int = 12,
     fixed_psf_radius: int | None = None,
+    auto_calibrate_pedestal: bool = True,
+    _allow_auto_expand: bool = True,
 ) -> CovarianceResult:
     """Accumulate lagged spatial cross-covariances across intensity bins and fit (G*gamma, psi).
 
@@ -114,6 +120,10 @@ def estimate_lagged_covariance(
         Number of intensity quantile bins B.
     fixed_psf_radius : int, optional
         If provided, uses this exact PSF integration radius instead of automatic detection.
+    auto_calibrate_pedestal : bool, default True
+        Whether to shift `bin_means` when off-diagonal ring-1 covariance detects a highly
+        significant (>5 sigma) additive pedestal error. Regardless of this flag, any detected
+        offset is recorded in `CovarianceResult.estimated_pedestal_offset`.
 
     Returns
     -------
@@ -125,6 +135,17 @@ def estimate_lagged_covariance(
     valid = trend_result.valid_mask.copy()
     n_t, height, width = residuals.shape
 
+    # Estimate scale-covariant single-pixel quantum ADU unit q_scale (scales strictly as c^1)
+    pos_exp = valid & (expected > 0.0)
+    if np.count_nonzero(pos_exp) >= 16:
+        med_r2 = float(np.median(residuals[pos_exp] ** 2))
+        med_mu = float(np.median(expected[pos_exp]))
+        q_scale = max(med_r2 / max(med_mu, 1e-12), 1e-12) if med_r2 > 0.0 else 1.0
+    elif np.any(valid):
+        q_scale = max(float(np.median(np.abs(residuals[valid]))), 1e-12)
+    else:
+        q_scale = 1.0
+
     # Post-detrending outlier safety gate: excise any surviving >6.0*sigma residual spike
     # (computing MAD strictly over valid unmasked frames so masked zeros never bias the scale)
     abs_res_nan = np.where(valid, np.abs(residuals), np.nan)
@@ -132,19 +153,20 @@ def estimate_lagged_covariance(
         warnings.simplefilter("ignore", category=RuntimeWarning)
         res_mad_2d = 1.4826 * np.nanmedian(abs_res_nan, axis=0)
         fallback_mad = (
-            float(np.nanmedian(res_mad_2d)) if np.any(np.isfinite(res_mad_2d)) else 1.0
+            float(np.nanmedian(res_mad_2d)) if np.any(np.isfinite(res_mad_2d)) else q_scale
         )
     res_mad_2d = np.nan_to_num(res_mad_2d, nan=fallback_mad)
     res_scale_3d = np.maximum(
         median_filter(res_mad_2d, size=7, mode="nearest")[None, :, :],
-        np.sqrt(np.maximum(expected, 1.5)),
+        np.sqrt(np.maximum(q_scale * expected, 1.5 * (q_scale**2))),
     )
-    spike_mask = valid & (np.abs(residuals) > 6.0 * res_scale_3d) & (np.abs(residuals) > 6.0)
+    spike_mask = valid & (np.abs(residuals) > 6.0 * res_scale_3d) & (np.abs(residuals) > 6.0 * q_scale)
     if np.any(spike_mask):
         spike_dilated = binary_dilation(spike_mask, structure=np.ones((1, 5, 5), dtype=bool))
         valid &= ~spike_dilated
 
-    L = min(max(1, int(max_lag)), min(height, width) // 4 - 1)
+    max_allowed_lag = max(1, min(height, width) // 4 - 1)
+    L = min(max(1, int(max_lag)), max_allowed_lag)
     # Build a spatially smoothed copy of expected intensity via normalized 2D convolution
     # strictly for conditioning-free quantile bin assignment, while keeping unblurred
     # expected intensity for unbiased bin means.
@@ -157,9 +179,10 @@ def estimate_lagged_covariance(
     smooth_num = gaussian_filter(mean_exp_2d * valid_2d, sigma=1.2, mode="nearest")
     smooth_den = gaussian_filter(valid_2d, sigma=1.2, mode="nearest")
     smooth_2d = np.where(smooth_den > 1e-6, smooth_num / np.maximum(smooth_den, 1e-6), mean_exp_2d)
+    exp_tol = 1e-6 * q_scale
     frame_scale = np.where(
-        mean_exp_2d[None, :, :] > 1e-6,
-        expected / np.maximum(mean_exp_2d[None, :, :], 1e-6),
+        mean_exp_2d[None, :, :] > exp_tol,
+        expected / np.maximum(mean_exp_2d[None, :, :], exp_tol),
         1.0,
     )
     bin_field = frame_scale * smooth_2d[None, :, :]
@@ -170,8 +193,8 @@ def estimate_lagged_covariance(
     core_bin_field = bin_field[:, L : height - L, L : width - L]
     core_res = residuals[:, L : height - L, L : width - L]
 
-    # Filter out ultra-sparse pixels (mu < 0.5 ADU) when forming intensity bins for continuous regression
-    active_core = core_valid & (core_bin_field >= 0.5)
+    # Filter out ultra-sparse pixels (mu < 0.5 * q_scale) when forming intensity bins for continuous regression
+    active_core = core_valid & (core_bin_field >= 0.5 * q_scale)
     if np.count_nonzero(active_core) < 500:
         active_core = core_valid & (core_bin_field > 0.0)
 
@@ -182,8 +205,9 @@ def estimate_lagged_covariance(
     # Define quantile bin edges across the smoothed intensity distribution
     quantiles = np.linspace(0.0, 100.0, n_bins + 1)
     edges = np.percentile(valid_mu, quantiles)
-    edges[0] -= 1e-6
-    edges[-1] += 1e-6
+    edge_pad = 1e-6 * max(float(edges[-1] - edges[0]), q_scale)
+    edges[0] -= edge_pad
+    edges[-1] += edge_pad
 
     # Assign each core voxel to a bin 0..B-1 (-1 if invalid) using smoothed bin_field,
     # while accumulating unblurred core_exp for unbiased bin_means.
@@ -242,11 +266,14 @@ def estimate_lagged_covariance(
     # Self-calibrate any additive pedestal error delta_p0 using off-diagonal ring 1 (r == 1),
     # where uncorrelated electronic readout noise psi is strictly zero: C_ring1(mu) = S_1 * (mu + delta_p0).
     low_q_res = core_res[core_valid & (core_exp <= np.percentile(valid_mu, 10.0))]
-    has_zero_noise_floor = low_q_res.size > 0 and float(np.median(low_q_res**2)) < 0.05
+    has_zero_noise_floor = (
+        low_q_res.size > 0 and float(np.median(low_q_res**2)) < 0.05 * (q_scale**2)
+    )
+    estimated_pedestal_offset = 0.0
     if (
         not has_zero_noise_floor
         and float(np.std(bin_means)) > 0.32 * float(np.mean(bin_means))
-        and float(np.min(bin_means)) > 1.5
+        and float(np.min(bin_means)) > 1.5 * q_scale
     ):
         ring1_mask = (r_inf_grid == 1) & (r_euc_grid <= 1.45)
         outer_mask = r_inf_grid == L
@@ -258,10 +285,18 @@ def estimate_lagged_covariance(
         s1, i1, s1_se, i1_se, _ = _irls_linear_fit(
             bin_means, c_ring1, bin_counts_use, clamp_nonnegative_intercept=False
         )
-        if s1 > max(5.0 * s1_se, 0.15) and abs(i1) > 5.0 * i1_se and abs(i1 / s1) > 2.0:
-            delta_p0 = float(np.clip(i1 / s1, -0.8 * float(np.min(bin_means)), 50.0))
-            if float(np.min(bin_means)) + delta_p0 > 0.5:
-                bin_means = np.maximum(bin_means + delta_p0, 0.05)
+        if (
+            s1 > max(5.0 * s1_se, 0.15 * q_scale)
+            and abs(i1) > 5.0 * i1_se
+            and abs(i1 / s1) > 2.0 * q_scale
+        ):
+            delta_p0 = float(
+                np.clip(i1 / s1, -0.8 * float(np.min(bin_means)), 50.0 * q_scale)
+            )
+            if float(np.min(bin_means)) + delta_p0 > 0.5 * q_scale:
+                estimated_pedestal_offset = delta_p0
+                if auto_calibrate_pedestal:
+                    bin_means = np.maximum(bin_means + delta_p0, 0.05 * q_scale)
 
     # 1. Fit zero-lag Photon Transfer Curve: C(0; mu_b) = g(0) * mu_b + psi
     # Electronic readout noise psi is localized at lag (0, 0), so fitting psi at lag (0, 0)
@@ -275,7 +310,7 @@ def estimate_lagged_covariance(
     if psi < 1.5 * psi_se and has_zero_noise_floor:
         psi = 0.0
         g0 = float(np.sum(weights * bin_means * c0_bins)) / max(
-            float(np.sum(weights * (bin_means**2))), 1e-12
+            float(np.sum(weights * (bin_means**2))), 1e-30
         )
 
     # 2. Estimate slope g(u) at every spatial lag u = (dy, dx)
@@ -285,17 +320,17 @@ def estimate_lagged_covariance(
     lag_slope_map[L, L] = g0
     lag_slope_se_map[L, L] = g0_se
 
-    denom_mu2 = float(np.sum(weights * (bin_means**2)))
+    denom_mu2 = max(float(np.sum(weights * (bin_means**2))), 1e-30)
     dof_1p = max(1, len(bin_means) - 1)
     for dy in range(-L, L + 1):
         for dx in range(-L, L + 1):
             if dy == 0 and dx == 0:
                 continue
             cu = bin_cov_use[:, L + dy, L + dx]
-            gu = float(np.sum(weights * bin_means * cu)) / max(denom_mu2, 1e-12)
+            gu = float(np.sum(weights * bin_means * cu)) / denom_mu2
             res_u = cu - gu * bin_means
             s2_u = float(np.sum(weights * res_u * res_u)) / dof_1p
-            se_u = float(np.sqrt(s2_u / max(denom_mu2, 1e-12)))
+            se_u = float(np.sqrt(s2_u / denom_mu2))
             lag_slope_map[L + dy, L + dx] = gu
             lag_slope_se_map[L + dy, L + dx] = se_u
 
@@ -334,10 +369,10 @@ def estimate_lagged_covariance(
             np.sum(bin_cov_use[:, ring_mask], axis=1)
             - n_ring_px * bg_baseline_per_lag * bin_means
         )
-        s_ring = float(np.sum(weights * bin_means * ring_cov_bins)) / max(denom_mu2, 1e-12)
+        s_ring = float(np.sum(weights * bin_means * ring_cov_bins)) / denom_mu2
         res_ring = ring_cov_bins - s_ring * bin_means
         s2_ring = float(np.sum(weights * res_ring * res_ring)) / dof_1p
-        se_ring = float(np.sqrt(s2_ring / max(denom_mu2, 1e-12)))
+        se_ring = float(np.sqrt(s2_ring / denom_mu2))
 
         shell_slopes[r] = s_ring
         shell_ses[r] = se_ring
@@ -353,7 +388,7 @@ def estimate_lagged_covariance(
         )
         res_disk = disk_cov_minus_psi - cumulative_slopes[r] * bin_means
         s2_disk = float(np.sum(weights * res_disk * res_disk)) / dof_1p
-        cumulative_ses[r] = float(np.sqrt(s2_disk / max(denom_mu2, 1e-12)))
+        cumulative_ses[r] = float(np.sqrt(s2_disk / denom_mu2))
 
     if fixed_psf_radius is not None:
         r_psf = int(np.clip(fixed_psf_radius, 0, L))
@@ -370,6 +405,23 @@ def estimate_lagged_covariance(
             else:
                 break
 
+        # Guard band: if r_PSF reached the outer ceiling L (where bg_baseline_per_lag is measured),
+        # automatically expand max_lag by up to +4 (if image geometry allows) so the baseline ring sits
+        # outside the active PSF support.
+        if _allow_auto_expand and r_psf == L and L < min(11, max_allowed_lag):
+            expanded_lag = min(L + 2, 11, max_allowed_lag)
+            if expanded_lag > L:
+                return estimate_lagged_covariance(
+                    trend_result=trend_result,
+                    max_lag=expanded_lag,
+                    n_bins=n_bins,
+                    fixed_psf_radius=None,
+                    auto_calibrate_pedestal=auto_calibrate_pedestal,
+                    _allow_auto_expand=(expanded_lag < min(L + 4, 11, max_allowed_lag)),
+                )
+
+    psf_converged = bool(r_psf < L) or (fixed_psf_radius is not None)
+
     # Final estimate of G*gamma and its standard error over the converged support disk
     support_mask = (r_inf_grid <= r_psf) & (r_euc_grid <= r_psf + 0.45)
     n_supp_px = int(np.count_nonzero(support_mask))
@@ -378,10 +430,10 @@ def estimate_lagged_covariance(
         - psi
         - n_supp_px * bg_baseline_per_lag * bin_means
     )
-    g_gamma = float(np.sum(weights * bin_means * total_cov_minus_psi)) / max(denom_mu2, 1e-12)
+    g_gamma = float(np.sum(weights * bin_means * total_cov_minus_psi)) / denom_mu2
     res_tot = total_cov_minus_psi - g_gamma * bin_means
     s2_tot = float(np.sum(weights * res_tot * res_tot)) / dof_1p
-    g_gamma_se = float(np.sqrt(s2_tot / max(denom_mu2, 1e-12)))
+    g_gamma_se = float(np.sqrt(s2_tot / denom_mu2))
 
     # Construct normalized 2D spatial autocorrelation kernel alpha(u)
     alpha_kernel = np.zeros_like(lag_slope_corr)
@@ -413,4 +465,6 @@ def estimate_lagged_covariance(
         bin_covariances=bin_cov_use,
         cumulative_g_gamma_se_by_radius=cumulative_ses,
         bg_baseline_per_lag=bg_baseline_per_lag,
+        estimated_pedestal_offset=estimated_pedestal_offset,
+        psf_converged=psf_converged,
     )
