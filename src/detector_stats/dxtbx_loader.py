@@ -34,6 +34,9 @@ class DxtbxTileData:
     bbox_yx: tuple[int, int, int, int]  # (y0, y1, x0, x1) pixel bounding box on the panel
     panel_shape_yx: tuple[int, int]  # (full_height, full_width) of the panel
     dials_dispersion_gains: np.ndarray | None = None  # (N_disp,) per-frame dispersion medians
+    sensor_material: str = ""  # e.g. 'Si', 'CdTe', 'Phosphor', etc. from dxtbx Panel
+    sensor_thickness_mm: float = 0.0  # sensor thickness in mm from dxtbx Panel
+    pixel_size_mm: tuple[float, float] = (0.0, 0.0)  # (px_x, px_y) in mm from dxtbx Panel
 
     @property
     def dials_dispersion_gain_mean(self) -> float | None:
@@ -311,6 +314,7 @@ def extract_dxtbx_tile(
             dials_gains = None
 
     trusted = panel.get_trusted_range()
+    px_size = panel.get_pixel_size()
     return DxtbxTileData(
         images=images,
         static_untrusted_mask=untrusted_mask,
@@ -323,6 +327,9 @@ def extract_dxtbx_tile(
         bbox_yx=(y0, y1, x0, x1),
         panel_shape_yx=(panel_height, panel_width),
         dials_dispersion_gains=dials_gains,
+        sensor_material=str(panel.get_material()) if hasattr(panel, "get_material") else "",
+        sensor_thickness_mm=float(panel.get_thickness()) if hasattr(panel, "get_thickness") else 0.0,
+        pixel_size_mm=(float(px_size[0]), float(px_size[1])),
     )
 
 
