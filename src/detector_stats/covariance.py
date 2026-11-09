@@ -291,9 +291,9 @@ def estimate_lagged_covariance(
             and abs(i1 / s1) > 2.0 * q_scale
         ):
             delta_p0 = float(
-                np.clip(i1 / s1, -0.8 * float(np.min(bin_means)), 50.0 * q_scale)
+                np.clip(i1 / s1, -0.98 * float(np.min(bin_means)), 50.0 * q_scale)
             )
-            if float(np.min(bin_means)) + delta_p0 > 0.5 * q_scale:
+            if float(np.min(bin_means)) + delta_p0 > 0.25 * q_scale:
                 estimated_pedestal_offset = delta_p0
                 if auto_calibrate_pedestal:
                     bin_means = np.maximum(bin_means + delta_p0, 0.05 * q_scale)

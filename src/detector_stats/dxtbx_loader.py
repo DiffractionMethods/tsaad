@@ -10,7 +10,10 @@ DIALS's single-frame spatial dispersion estimator (`DispersionThresholdDebug` /
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import re
+import tempfile
 from typing import Literal, Sequence
 
 import numpy as np
@@ -90,11 +93,41 @@ def load_imageset(source: object):
 
     if isinstance(source, Sequence):
         paths = [str(Path(item)) for item in source]
-        expts = ExperimentListFactory.from_filenames(paths)
+        try:
+            expts = ExperimentListFactory.from_filenames(paths)
+        except ValueError as exc:
+            if "Could not determine filename template" not in str(exc):
+                raise
+            # Workaround for Windows-style parenthesized filenames like '9P59 (100).sfrm'
+            # where dxtbx's template_regex cannot parse the parenthesized frame index.
+            link_dir = Path(tempfile.mkdtemp(prefix="detector_stats_dxtbx_"))
+            sorted_paths = sorted(
+                (Path(p) for p in paths),
+                key=lambda p: [
+                    int(tok) if tok.isdigit() else tok.lower()
+                    for tok in re.split(r"(\d+)", p.name)
+                ],
+            )
+            linked_paths: list[str] = []
+            for idx, orig in enumerate(sorted_paths, start=1):
+                m = re.match(r"^(.*?)\s*\((\d+)\)(\.[^.]+)$", orig.name)
+                if m:
+                    prefix = re.sub(r"\W+", "_", m.group(1)).strip("_") or "image"
+                    frame_num = int(m.group(2))
+                    ext = m.group(3)
+                    clean_name = f"{prefix}_{frame_num:04d}{ext}"
+                else:
+                    stem = re.sub(r"\W+", "_", orig.stem).strip("_") or "image"
+                    clean_name = f"{stem}_{idx:04d}{orig.suffix}"
+                dst = link_dir / clean_name
+                if not dst.exists():
+                    os.symlink(orig.resolve(), dst)
+                linked_paths.append(str(dst))
+            expts = ExperimentListFactory.from_filenames(linked_paths)
         imagesets = expts.imagesets()
         if not imagesets:
             raise ValueError(f"No imagesets found in {source!r}.")
-        return imagesets[0]
+        return sorted(imagesets, key=lambda ims: len(ims), reverse=True)[0]
 
     raise TypeError(f"Unsupported dxtbx source type: {type(source)!r}")
 

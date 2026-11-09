@@ -682,11 +682,13 @@ def plot_separation_or_residuals(
         ax.legend(fontsize=7.6, loc="upper right", framealpha=0.9)
         return ax
 
-    valid = trend.valid_mask & (trend.expected_intensity >= 1.0)
+    ped_offset = float(getattr(cov, "estimated_pedestal_offset", 0.0))
+    mu_shifted_all = trend.expected_intensity + ped_offset
+    valid = trend.valid_mask & (mu_shifted_all >= 1.0)
     if not np.any(valid):
         valid = trend.valid_mask
     res = trend.residuals[valid]
-    mu = trend.expected_intensity[valid]
+    mu = np.maximum(mu_shifted_all[valid], 1e-3)
     sigma_px = np.sqrt(np.maximum(cov.apparent_single_pixel_gain * mu + cov.psi, 1e-3))
     z = res / sigma_px
     z_clip = z[(z >= -5.0) & (z <= 5.0)]
