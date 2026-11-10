@@ -266,7 +266,8 @@ def _read_bruker_format100_panel(image_path: str) -> tuple[np.ndarray, float] | 
         ncols = int(hdr["NCOLS"].split()[0])
         n_u, n_2o, n_4o = (int(e) for e in hdr["NOVERFL"].split())
         npixelb = [int(e) for e in hdr["NPIXELB"].split()]
-        baseline = int(hdr["NEXP"].split()[2]) if n_u != -1 else 0
+        nexp_parts = [int(e) for e in hdr["NEXP"].split()]
+        header_baseline = nexp_parts[2] if len(nexp_parts) > 2 else 0
         with open(image_path, "rb") as f:
             f.read(int(hdr["HDRBLKS"]) * 512)
             dt = np.uint8 if npixelb[0] == 1 else np.uint16
@@ -295,11 +296,13 @@ def _read_bruker_format100_panel(image_path: str) -> tuple[np.ndarray, float] | 
             raw[raw == 255] = o2_vals
         if o4_vals is not None:
             raw[raw == 65535] = o4_vals
+        # When n_u != -1, the 1-byte image array had header_baseline subtracted prior to saving;
+        # when n_u == -1, header_baseline is already present in the stored pixel values.
         if n_u != -1:
-            raw += float(baseline)
+            raw += float(header_baseline)
         if u_vals is not None:
             raw[zero_mask] = u_vals
-        return raw.reshape((nrows, ncols)), float(baseline)
+        return raw.reshape((nrows, ncols)), float(header_baseline)
     except Exception:
         return None
 

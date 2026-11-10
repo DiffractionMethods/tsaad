@@ -39,65 +39,165 @@ class CovarianceResult:
     psf_converged: bool = True  # True if r_PSF < max_lag (converged inside lag window)
 
 
+def _flat_top_redescending_weights(std_res: np.ndarray, min_inliers: int) -> np.ndarray:
+    """Compute C1-smooth Hampel/Tukey flat-top redescending robustness weights in [0, 1].
+
+    Preserves exact unit weight (100% Gauss-Markov efficiency and zero sensitivity to small
+    perturbations) for normal inliers `|z| <= 3.5`, tapers smoothly over `3.5 < |z| < 7.0`, and
+    completely zeroes out (`w = 0`) extreme high-leverage outliers `|z| >= 7.0`.
+    `std_res` must already be dimensionless (standardized by physical sampling SD).
+    """
+    med_sr = float(np.median(std_res))
+    mad = 1.4826 * float(np.median(np.abs(std_res - med_sr)))
+    mad_eff = max(mad, 1.0)
+    z = np.abs(std_res - med_sr) / mad_eff
+    t = np.clip((z - 3.5) / 3.5, 0.0, 1.0)
+    rob = np.where(z <= 3.5, 1.0, np.where(z < 7.0, (1.0 - t * t) ** 2, 0.0))
+    if np.count_nonzero(rob > 0.05) < min_inliers:
+        uh = z / 3.5
+        rob = np.where(uh <= 1.0, 1.0, 1.0 / uh)
+    return rob
+
+
 def _irls_linear_fit(
     x: np.ndarray,
     y: np.ndarray,
     counts: np.ndarray,
-    n_iter: int = 6,
+    n_iter: int = 8,
     clamp_nonnegative_intercept: bool = True,
 ) -> tuple[float, float, float, float, np.ndarray]:
     """Fit y = slope * x + intercept via Iteratively Reweighted Least Squares (IRLS).
 
-    Returns (slope, intercept, slope_se, intercept_se, weights).
-    All weight floors scale homogeneously with `mean(|y|)` so the fit is strictly
-    scale-equivariant under `(x, y) -> (c * x, c^2 * y)`.
+    Initialized via pairwise Theil-Sen median slope and reweighted with flat-top redescending
+    weights so normal statistical fluctuations keep unit weight while extreme high-leverage
+    Bragg-halo or clipped bins are cleanly rejected. Strictly scale-equivariant under
+    `(x, y) -> (c * x, c^2 * y)`. Returns (slope, intercept, slope_se, intercept_se, weights).
     """
-    y_ref = max(float(np.mean(np.abs(y))), 1e-30)
-    x_ref = max(float(np.mean(np.abs(x))), 1e-30)
-    scale0 = np.maximum(np.abs(y), 0.05 * y_ref) / np.sqrt(np.maximum(counts, 1.0))
+    y_abs = np.abs(y)
+    x_abs = np.abs(x)
+    y_ref = max(float(np.median(y_abs)), 1e-6 * float(np.mean(y_abs)), 1e-300)
+    x_ref = max(float(np.median(x_abs)), 1e-6 * float(np.mean(x_abs)), 1e-300)
+
+    dx_span = float(np.max(x) - np.min(x))
+    dx_mat = x[:, None] - x[None, :]
+    dy_mat = y[:, None] - y[None, :]
+    valid_pairs = dx_mat > max(0.05 * dx_span, 1e-12 * x_ref)
+    if np.any(valid_pairs):
+        slope = float(np.median(dy_mat[valid_pairs] / dx_mat[valid_pairs]))
+        intercept = float(np.median(y - slope * x))
+        if clamp_nonnegative_intercept and intercept < 0.0:
+            intercept = 0.0
+            x_pos = x > 0.01 * x_ref
+            if np.any(x_pos):
+                slope = float(np.median(y[x_pos] / x[x_pos]))
+    else:
+        slope = y_ref / x_ref
+        intercept = 0.0
+
+    min_inliers = min(max(4, (len(x) + 1) // 2), len(x))
+    rob = np.ones_like(x, dtype=np.float64)
+    # Zero-lag sample variance of r^2 has theoretical SD ~ sqrt(2) * E[r^2] / sqrt(N_b)
+    scale0 = np.sqrt(2.0) * np.maximum(y_abs, 0.05 * y_ref) / np.sqrt(np.maximum(counts, 1.0))
     w = 1.0 / (scale0**2)
     w /= float(np.mean(w))
 
-    slope = y_ref / x_ref
-    intercept = 0.0
     for _ in range(max(1, n_iter)):
+        pred_raw = slope * x + intercept
+        pred_ref = max(float(np.median(np.abs(pred_raw))), y_ref)
+        scale = (
+            np.sqrt(2.0)
+            * np.maximum(pred_raw, 0.05 * pred_ref)
+            / np.sqrt(np.maximum(counts, 1.0))
+        )
+        std_res = (y - pred_raw) / scale
+        rob = _flat_top_redescending_weights(std_res, min_inliers=min_inliers)
+
+        inv_var = 1.0 / (scale**2)
+        inv_var /= float(np.mean(inv_var))
+        w = rob * inv_var
+        w_mean = float(np.mean(w))
+        if w_mean <= 1e-30:
+            w = inv_var.copy()
+        else:
+            w /= w_mean
+
         sw = float(np.sum(w))
         sx = float(np.sum(w * x))
         sy = float(np.sum(w * y))
         sxx = float(np.sum(w * x * x))
         sxy = float(np.sum(w * x * y))
         denom = sw * sxx - sx * sx
-        if abs(denom) <= 1e-24 * (sxx * sw + 1e-30):
+        if abs(denom) <= 1e-24 * (sxx * sw + 1e-300):
             break
         slope = (sw * sxy - sx * sy) / denom
         intercept = (sxx * sy - sx * sxy) / denom
         if clamp_nonnegative_intercept and intercept < 0.0:
             intercept = 0.0
-            slope = float(np.sum(w * x * y) / max(float(np.sum(w * x * x)), 1e-30))
-
-        pred_raw = slope * x + intercept
-        pred_ref = max(float(np.mean(np.abs(pred_raw))), y_ref)
-        pred = np.maximum(pred_raw, 1e-4 * pred_ref)
-        scale = np.maximum(pred, 0.05 * pred_ref) / np.sqrt(np.maximum(counts, 1.0))
-        std_res = (y - pred_raw) / scale
-        mad = 1.4826 * float(np.median(np.abs(std_res - np.median(std_res)))) + 1e-12
-        # Standardized Huber robustness weight * inverse variance weight 1 / scale^2
-        u = np.abs(std_res) / (3.0 * mad)
-        huber = np.where(u <= 1.0, 1.0, 1.0 / u)
-        w = huber / (scale**2)
-        w /= float(np.mean(w))
+            slope = float(np.sum(w * x * y) / max(sxx, 1e-300))
 
     # Compute standard errors of slope and intercept
-    dof = max(1, len(x) - 2)
+    dof = max(1.0, float(np.count_nonzero(rob > 0.05)) - 2.0)
     res = y - (slope * x + intercept)
     s2 = float(np.sum(w * res * res)) / dof
     sw = float(np.sum(w))
     sx = float(np.sum(w * x))
     sxx = float(np.sum(w * x * x))
-    denom = max(sw * sxx - sx * sx, 1e-30)
+    denom = max(sw * sxx - sx * sx, 1e-300)
     slope_se = float(np.sqrt(s2 * sw / denom))
     intercept_se = float(np.sqrt(s2 * sxx / denom))
     return float(slope), float(intercept), slope_se, intercept_se, w
+
+
+def _irls_zero_intercept_fit(
+    x: np.ndarray,
+    y: np.ndarray,
+    sigma_y: np.ndarray,
+    n_iter: int = 6,
+) -> tuple[float, float, np.ndarray]:
+    """Fit zero-intercept linear model `y = slope * x` via flat-top redescending GLS/IRLS.
+
+    `sigma_y` is the physical ADU^2 sampling standard deviation of each bin's covariance
+    estimate (scaling as `c^2`). Initialized at the precision-weighted median of `y / x`
+    so high-intensity bins contaminated by Bragg/powder halos cannot pull slopes upward,
+    while normal `<= 3 sigma` bins retain exact unit robustness weight.
+    """
+    x_ref = max(float(np.median(np.abs(x))), 1e-6 * float(np.mean(np.abs(x))), 1e-300)
+    x_pos = np.maximum(x, 1e-12 * x_ref)
+    ratios = y / x_pos
+
+    inv_var = 1.0 / np.maximum(sigma_y, 1e-300) ** 2
+    base_weights = inv_var / max(float(np.mean(inv_var)), 1e-300)
+
+    v_raw = base_weights * ((x_pos / x_ref) ** 2)
+    v_weights = np.maximum(v_raw, 1e-12 * max(float(np.mean(v_raw)), 1e-300))
+
+    order = np.argsort(ratios)
+    cum_v = np.cumsum(v_weights[order])
+    med_idx = int(np.searchsorted(cum_v, 0.5 * cum_v[-1]))
+    med_idx = min(max(med_idx, 0), len(ratios) - 1)
+    slope = float(ratios[order[med_idx]])
+
+    min_inliers = min(max(4, (len(x) + 1) // 2), len(x))
+    rob = np.ones_like(x_pos)
+    w = base_weights.copy()
+    x_norm = x / x_ref
+
+    for _ in range(max(1, n_iter)):
+        std_res = (y - slope * x) / np.maximum(sigma_y, 1e-300)
+        rob = _flat_top_redescending_weights(std_res, min_inliers=min_inliers)
+        w = base_weights * rob
+        if float(np.sum(w * x_norm * x_norm)) <= 1e-30:
+            rob = np.ones_like(x_pos)
+            w = base_weights.copy()
+            break
+        slope = float(np.sum(w * x * y)) / max(float(np.sum(w * x * x)), 1e-300)
+
+    dof = max(1.0, float(np.count_nonzero(rob > 0.05)) - 1.0)
+    res = y - slope * x
+    denom = max(float(np.sum(w * x * x)), 1e-300)
+    s2 = float(np.sum(w * res * res)) / dof
+    slope_se = float(np.sqrt(s2 / denom))
+    return float(slope), slope_se, w
 
 
 def estimate_lagged_covariance(
@@ -202,16 +302,18 @@ def estimate_lagged_covariance(
     if valid_mu.size == 0:
         raise ValueError("No valid background pixels available for covariance estimation.")
 
-    # Define quantile bin edges across the smoothed intensity distribution
+    # Define quantile bin edges across the dimensionless normalized intensity distribution
+    norm_bin_field = core_bin_field / max(q_scale, 1e-300)
+    norm_valid_mu = norm_bin_field[active_core]
     quantiles = np.linspace(0.0, 100.0, n_bins + 1)
-    edges = np.percentile(valid_mu, quantiles)
-    edge_pad = 1e-6 * max(float(edges[-1] - edges[0]), q_scale)
+    edges = np.percentile(norm_valid_mu, quantiles)
+    edge_pad = 1e-6 * max(float(edges[-1] - edges[0]), 1.0)
     edges[0] -= edge_pad
     edges[-1] += edge_pad
 
     # Assign each core voxel to a bin 0..B-1 (-1 if invalid) using smoothed bin_field,
     # while accumulating unblurred core_exp for unbiased bin_means.
-    bin_idx = np.digitize(core_bin_field, edges) - 1
+    bin_idx = np.digitize(norm_bin_field, edges) - 1
     bin_idx = np.where(active_core & (bin_idx >= 0) & (bin_idx < n_bins), bin_idx, -1)
     flat_bins = bin_idx.ravel()
     valid_flat_mask = flat_bins >= 0
@@ -302,37 +404,45 @@ def estimate_lagged_covariance(
     # Electronic readout noise psi is localized at lag (0, 0), so fitting psi at lag (0, 0)
     # achieves (2R+1)^2 times lower variance than fitting a free intercept to summed lags.
     c0_bins = bin_cov_use[:, L, L]
-    g0, psi, g0_se, psi_se, weights = _irls_linear_fit(
+    g0, psi, g0_se, psi_se, _ = _irls_linear_fit(
         bin_means, c0_bins, bin_counts_use, clamp_nonnegative_intercept=True
     )
-    # If the fitted intercept is statistically indistinguishable from 0 (within 1.5*SE)
+
+    c0_abs = np.abs(c0_bins)
+    c0_ref = max(float(np.median(c0_abs)), 1e-6 * float(np.mean(c0_abs)), 1e-300)
+    pred_c0 = np.maximum(max(g0, 0.0) * bin_means + psi, 0.05 * c0_ref)
+    scale_c0 = pred_c0 / np.sqrt(np.maximum(bin_counts_use, 1.0))
+    base_weights = 1.0 / (scale_c0**2)
+    base_weights /= float(np.mean(base_weights))
+
+    # If the fitted intercept is statistically indistinguishable from 0 (within 2.0*SE)
     # and the lowest-intensity pixels show zero baseline noise floor, set psi = 0.0.
-    if psi < 1.5 * psi_se and has_zero_noise_floor:
+    if psi < 2.0 * psi_se and has_zero_noise_floor:
         psi = 0.0
-        g0 = float(np.sum(weights * bin_means * c0_bins)) / max(
-            float(np.sum(weights * (bin_means**2))), 1e-30
-        )
+        g0, g0_se, _ = _irls_zero_intercept_fit(bin_means, c0_bins, np.sqrt(2.0) * scale_c0)
+        pred_c0 = np.maximum(max(g0, 0.0) * bin_means, 0.05 * c0_ref)
+        scale_c0 = pred_c0 / np.sqrt(np.maximum(bin_counts_use, 1.0))
+        base_weights = 1.0 / (scale_c0**2)
+        base_weights /= float(np.mean(base_weights))
 
     # 2. Estimate slope g(u) at every spatial lag u = (dy, dx)
-    # At u != (0, 0), theoretical intercept at mu = 0 is zero: C(u; mu_b) = g(u) * mu_b
+    # At u != (0, 0), theoretical intercept at mu = 0 is zero: C(u; mu_b) = g(u) * mu_b.
+    # Use flat-top redescending IRLS per lag so high-mu Bragg/powder halos cannot pull g(u) up.
     lag_slope_map = np.zeros((k_size, k_size), dtype=np.float64)
     lag_slope_se_map = np.zeros((k_size, k_size), dtype=np.float64)
     lag_slope_map[L, L] = g0
     lag_slope_se_map[L, L] = g0_se
 
-    denom_mu2 = max(float(np.sum(weights * (bin_means**2))), 1e-30)
-    dof_1p = max(1, len(bin_means) - 1)
     for dy in range(-L, L + 1):
         for dx in range(-L, L + 1):
-            if dy == 0 and dx == 0:
+            if (dy < 0) or (dy == 0 and dx <= 0):
                 continue
             cu = bin_cov_use[:, L + dy, L + dx]
-            gu = float(np.sum(weights * bin_means * cu)) / denom_mu2
-            res_u = cu - gu * bin_means
-            s2_u = float(np.sum(weights * res_u * res_u)) / dof_1p
-            se_u = float(np.sqrt(s2_u / denom_mu2))
+            gu, se_u, _ = _irls_zero_intercept_fit(bin_means, cu, scale_c0)
             lag_slope_map[L + dy, L + dx] = gu
+            lag_slope_map[L - dy, L - dx] = gu
             lag_slope_se_map[L + dy, L + dx] = se_u
+            lag_slope_se_map[L - dy, L - dx] = se_u
 
     # 3. Evaluate cumulative slope S(R) across lag shells R = 0..L and detect r_PSF
     yy, xx = np.mgrid[-L : L + 1, -L : L + 1]
@@ -342,6 +452,55 @@ def estimate_lagged_covariance(
     # Estimate and subtract any residual long-range background baseline from the outermost ring (r == L)
     outer_ring_mask = r_inf_grid == L
     bg_baseline_per_lag = max(0.0, float(np.median(lag_slope_map[outer_ring_mask])))
+
+    # Enforce Cauchy-Schwarz / PSF peak-monotonicity lower bound on g(0) when narrow-mu ROI
+    # slope-intercept collinearity trades lag-0 slope g(0) into readout noise intercept psi.
+    cardinal_mask = (r_inf_grid == 1) & (r_euc_grid <= 1.05)
+    diag_mask = (np.abs(yy) == 1) & (np.abs(xx) == 1)
+    off_diag_mask = r_inf_grid >= 1
+    if np.any(cardinal_mask):
+        cardinal_vals = lag_slope_map[cardinal_mask] - bg_baseline_per_lag
+        mean_g1 = float(np.mean(cardinal_vals))
+        se_mean_g1 = 0.5 * float(np.sqrt(np.mean(lag_slope_se_map[cardinal_mask] ** 2)))
+        max_off_diag = float(np.max(lag_slope_map[off_diag_mask] - bg_baseline_per_lag))
+        if mean_g1 > max(3.0 * se_mean_g1, 0.02 * q_scale):
+            mean_g_diag = (
+                float(np.mean(lag_slope_map[diag_mask] - bg_baseline_per_lag))
+                if np.any(diag_mask)
+                else 0.0
+            )
+            if mean_g_diag > 0.15 * mean_g1:
+                step_ratio = float(np.clip(0.95 * (mean_g1 / mean_g_diag), 1.02, 2.5))
+            else:
+                step_ratio = 1.25
+            g0_min_bound = max(max_off_diag, step_ratio * mean_g1)
+            if (g0 - bg_baseline_per_lag) < g0_min_bound:
+                g0 = g0_min_bound + bg_baseline_per_lag
+                lag_slope_map[L, L] = g0
+                res_psi = c0_bins - g0 * bin_means
+                min_inliers = min(max(4, (len(bin_means) + 1) // 2), len(bin_means))
+                sigma_psi = np.sqrt(2.0) * scale_c0
+                w_psi = base_weights.copy()
+                psi = max(0.0, float(np.sum(w_psi * res_psi)) / max(float(np.sum(w_psi)), 1e-300))
+                for _ in range(3):
+                    std_r = (res_psi - psi) / np.maximum(sigma_psi, 1e-300)
+                    rob_r = _flat_top_redescending_weights(std_r, min_inliers=min_inliers)
+                    w_psi = base_weights * rob_r
+                    psi = max(
+                        0.0, float(np.sum(w_psi * res_psi)) / max(float(np.sum(w_psi)), 1e-300)
+                    )
+                w_sum = max(float(np.sum(w_psi)), 1e-300)
+                dof_psi = max(1.0, float(np.sum(w_psi / np.maximum(base_weights, 1e-300))) - 1.0)
+                s2_psi = float(np.sum(w_psi * ((res_psi - psi) ** 2))) / dof_psi
+                mean_mu_w = float(np.sum(w_psi * bin_means)) / w_sum
+                g0_se = max(g0_se, step_ratio * se_mean_g1)
+                lag_slope_se_map[L, L] = g0_se
+                psi_se = float(np.sqrt(s2_psi / w_sum + (mean_mu_w * step_ratio * se_mean_g1) ** 2))
+                pred_c0 = np.maximum(max(g0, 0.0) * bin_means + psi, 0.05 * c0_ref)
+                scale_c0 = pred_c0 / np.sqrt(np.maximum(bin_counts_use, 1.0))
+                base_weights = 1.0 / (scale_c0**2)
+                base_weights /= float(np.mean(base_weights))
+
     lag_slope_corr = lag_slope_map - bg_baseline_per_lag
 
     cumulative_slopes = np.zeros(L + 1, dtype=np.float64)
@@ -369,10 +528,9 @@ def estimate_lagged_covariance(
             np.sum(bin_cov_use[:, ring_mask], axis=1)
             - n_ring_px * bg_baseline_per_lag * bin_means
         )
-        s_ring = float(np.sum(weights * bin_means * ring_cov_bins)) / denom_mu2
-        res_ring = ring_cov_bins - s_ring * bin_means
-        s2_ring = float(np.sum(weights * res_ring * res_ring)) / dof_1p
-        se_ring = float(np.sqrt(s2_ring / denom_mu2))
+        s_ring, se_ring, _ = _irls_zero_intercept_fit(
+            bin_means, ring_cov_bins, np.sqrt(float(n_ring_px)) * scale_c0
+        )
 
         shell_slopes[r] = s_ring
         shell_ses[r] = se_ring
@@ -380,15 +538,16 @@ def estimate_lagged_covariance(
         cumulative_slopes[r] = cumulative_slopes[r - 1] + s_ring
 
         # Standard error on cumulative disk slope S(r)
-        n_disk_px = int(np.count_nonzero(disk_mask))
+        n_disk_px = max(1, int(np.count_nonzero(disk_mask)) )
         disk_cov_minus_psi = (
             np.sum(bin_cov_use[:, disk_mask], axis=1)
             - psi
             - n_disk_px * bg_baseline_per_lag * bin_means
         )
-        res_disk = disk_cov_minus_psi - cumulative_slopes[r] * bin_means
-        s2_disk = float(np.sum(weights * res_disk * res_disk)) / dof_1p
-        cumulative_ses[r] = float(np.sqrt(s2_disk / denom_mu2))
+        _, se_disk, _ = _irls_zero_intercept_fit(
+            bin_means, disk_cov_minus_psi, np.sqrt(float(n_disk_px)) * scale_c0
+        )
+        cumulative_ses[r] = se_disk
 
     if fixed_psf_radius is not None:
         r_psf = int(np.clip(fixed_psf_radius, 0, L))
@@ -424,16 +583,8 @@ def estimate_lagged_covariance(
 
     # Final estimate of G*gamma and its standard error over the converged support disk
     support_mask = (r_inf_grid <= r_psf) & (r_euc_grid <= r_psf + 0.45)
-    n_supp_px = int(np.count_nonzero(support_mask))
-    total_cov_minus_psi = (
-        np.sum(bin_cov_use[:, support_mask], axis=1)
-        - psi
-        - n_supp_px * bg_baseline_per_lag * bin_means
-    )
-    g_gamma = float(np.sum(weights * bin_means * total_cov_minus_psi)) / denom_mu2
-    res_tot = total_cov_minus_psi - g_gamma * bin_means
-    s2_tot = float(np.sum(weights * res_tot * res_tot)) / dof_1p
-    g_gamma_se = float(np.sqrt(s2_tot / denom_mu2))
+    g_gamma = float(cumulative_slopes[r_psf])
+    g_gamma_se = float(cumulative_ses[r_psf])
 
     # Construct normalized 2D spatial autocorrelation kernel alpha(u)
     alpha_kernel = np.zeros_like(lag_slope_corr)
