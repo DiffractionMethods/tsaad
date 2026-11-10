@@ -302,3 +302,40 @@ def test_high_mu_bragg_halo_bins_rejected_by_tukey_biweight() -> None:
     assert res.psf_radius == 0
     assert res.s2_factor == pytest.approx(1.0, abs=1e-6)
     assert res.g_gamma == pytest.approx(1.0, abs=0.08)
+
+
+def test_janesick_quadratic_halo_excess_variance_guard() -> None:
+    """When non-separable diffuse background curvature injects spatially correlated
+    multiplicative fluctuations `eta(x, t) * mu(x, t)` across ALL intensity bins (producing
+    Janesick quadratic excess variance `C(u; mu) = s * mu + beta * mu^2`, mimicking
+    `dmoa_6ak1` / `53bp1_6vip`), `_irls_offdiag_fit` must separate out `beta * mu^2`
+    and recover the true linear shot-noise gain `G*gamma = 1.0` and `r_PSF = 0`.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(2020)
+    n_t, ny, nx = 40, 88, 88
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    # Smooth radial gradient spanning 15..90 ADU (std/mean ~ 0.42)
+    r_norm = np.hypot(yy, xx) / np.hypot(ny, nx)
+    mu_2d = 15.0 + 75.0 * ((1.0 - r_norm) ** 1.5)
+
+    # Multiplicative frame-to-frame medium-scale (sigma=2.5 px) background modulation eta(x, t)
+    eta = np.empty((n_t, ny, nx), dtype=np.float64)
+    for t in range(n_t):
+        raw_mod = gaussian_filter(rng.normal(0.0, 0.35, size=(ny, nx)), sigma=2.5, mode="nearest")
+        eta[t] = np.clip(raw_mod, -0.25, 0.25)
+
+    lam = np.maximum(1.0, mu_2d[None, :, :] * (1.0 + eta))
+    y = rng.poisson(lam).astype(np.float64)
+
+    res = estimate_detector_statistics(
+        y,
+        pedestal=0.0,
+        trend_method="hollow_stencil_kriging",
+        max_lag=5,
+        auto_calibrate_pedestal=False,
+    )
+    assert res.psf_radius == 0
+    assert res.s2_factor == pytest.approx(1.0, abs=1e-6)
+    assert res.g_gamma == pytest.approx(1.0, abs=0.08)

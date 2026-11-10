@@ -200,6 +200,70 @@ def _irls_zero_intercept_fit(
     return float(slope), slope_se, w
 
 
+def _irls_offdiag_fit(
+    x: np.ndarray,
+    y: np.ndarray,
+    sigma_y: np.ndarray,
+    n_iter: int = 6,
+) -> tuple[float, float, np.ndarray]:
+    """Estimate off-diagonal linear shot-noise slope `s` in `C(u; mu) = s * mu`, guarding
+    against Janesick quadratic excess variance `C(u; mu) = s * mu + beta * mu^2` (`beta > 0`)
+    caused by spatially correlated unmodeled background/halo curvature across intensity bins.
+    """
+    slope, slope_se, w = _irls_zero_intercept_fit(x, y, sigma_y, n_iter=n_iter)
+    if (
+        slope > 2.0 * slope_se
+        and len(x) >= 7
+        and float(np.std(x)) > 0.18 * float(np.mean(x))
+    ):
+        x_ref = max(float(np.median(np.abs(x))), 1e-6 * float(np.mean(np.abs(x))), 1e-300)
+        x_pos = np.maximum(x, 1e-12 * x_ref)
+        q = y / x_pos
+        inv_var = 1.0 / np.maximum(sigma_y, 1e-300) ** 2
+        v = inv_var * ((x_pos / x_ref) ** 2)
+        v /= max(float(np.mean(v)), 1e-300)
+
+        dx_span = float(np.max(x_pos) - np.min(x_pos))
+        dx_mat = x_pos[:, None] - x_pos[None, :]
+        dq_mat = q[:, None] - q[None, :]
+        ok_pairs = dx_mat > max(0.05 * dx_span, 1e-12 * x_ref)
+        beta = float(np.median(dq_mat[ok_pairs] / dx_mat[ok_pairs])) if np.any(ok_pairs) else 0.0
+        s2_lin = float(np.median(q - beta * x_pos))
+
+        min_inliers = min(max(5, (len(x) + 1) // 2), len(x))
+        rob_q = np.ones_like(x_pos)
+        wq = v.copy()
+        for _ in range(max(1, n_iter)):
+            pred_q = s2_lin + beta * x_pos
+            std_r = (q - pred_q) * x_pos / np.maximum(sigma_y, 1e-300)
+            rob_q = _flat_top_redescending_weights(std_r, min_inliers=min_inliers)
+            wq = v * rob_q
+            sw = float(np.sum(wq))
+            sx = float(np.sum(wq * x_pos))
+            sq = float(np.sum(wq * q))
+            sxx = float(np.sum(wq * x_pos * x_pos))
+            sxq = float(np.sum(wq * x_pos * q))
+            den = sw * sxx - sx * sx
+            if abs(den) <= 1e-24 * (sw * sxx + 1e-300):
+                break
+            s2_lin = (sxx * sq - sx * sxq) / den
+            beta = (sw * sxq - sx * sq) / den
+
+        dof_q = max(1.0, float(np.count_nonzero(rob_q > 0.05)) - 2.0)
+        res_q = q - (s2_lin + beta * x_pos)
+        sig2_q = float(np.sum(wq * res_q * res_q)) / dof_q
+        sw = float(np.sum(wq))
+        sx = float(np.sum(wq * x_pos))
+        sxx = float(np.sum(wq * x_pos * x_pos))
+        den = max(sw * sxx - sx * sx, 1e-300)
+        s2_se = float(np.sqrt(sig2_q * sxx / den))
+        beta_se = float(np.sqrt(sig2_q * sw / den))
+        if beta > 4.2 * beta_se and beta * float(np.mean(x_pos)) > 0.25 * slope:
+            slope = max(0.0, min(float(s2_lin), slope))
+            slope_se = s2_se
+    return float(slope), slope_se, w
+
+
 def estimate_lagged_covariance(
     trend_result: TrendResult,
     max_lag: int = 7,
@@ -438,7 +502,7 @@ def estimate_lagged_covariance(
             if (dy < 0) or (dy == 0 and dx <= 0):
                 continue
             cu = bin_cov_use[:, L + dy, L + dx]
-            gu, se_u, _ = _irls_zero_intercept_fit(bin_means, cu, scale_c0)
+            gu, se_u, _ = _irls_offdiag_fit(bin_means, cu, scale_c0)
             lag_slope_map[L + dy, L + dx] = gu
             lag_slope_map[L - dy, L - dx] = gu
             lag_slope_se_map[L + dy, L + dx] = se_u
@@ -528,7 +592,7 @@ def estimate_lagged_covariance(
             np.sum(bin_cov_use[:, ring_mask], axis=1)
             - n_ring_px * bg_baseline_per_lag * bin_means
         )
-        s_ring, se_ring, _ = _irls_zero_intercept_fit(
+        s_ring, se_ring, _ = _irls_offdiag_fit(
             bin_means, ring_cov_bins, np.sqrt(float(n_ring_px)) * scale_c0
         )
 
@@ -538,13 +602,13 @@ def estimate_lagged_covariance(
         cumulative_slopes[r] = cumulative_slopes[r - 1] + s_ring
 
         # Standard error on cumulative disk slope S(r)
-        n_disk_px = max(1, int(np.count_nonzero(disk_mask)) )
+        n_disk_px = max(1, int(np.count_nonzero(disk_mask)))
         disk_cov_minus_psi = (
             np.sum(bin_cov_use[:, disk_mask], axis=1)
             - psi
             - n_disk_px * bg_baseline_per_lag * bin_means
         )
-        _, se_disk, _ = _irls_zero_intercept_fit(
+        _, se_disk, _ = _irls_offdiag_fit(
             bin_means, disk_cov_minus_psi, np.sqrt(float(n_disk_px)) * scale_c0
         )
         cumulative_ses[r] = se_disk
