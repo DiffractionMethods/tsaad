@@ -240,6 +240,60 @@ def compute_dials_dispersion_gain_on_tile(
     return np.asarray(gains, dtype=np.float64)
 
 
+def _read_bruker_format100_panel(image_path: str) -> tuple[np.ndarray, float] | None:
+    """Read a Bruker FORMAT 100 `.sfrm` file directly, avoiding the underflow + baseline
+    double-addition bug in `dxtbx.format.FormatBrukerModern.get_raw_data()` when `num_underflows > 0`.
+
+    Returns `(image_2d, baseline_pedestal)` or `None` if not a Bruker FORMAT 100 file.
+    """
+    try:
+        from dxtbx.format.FormatBruker import FormatBruker
+
+        hdr = FormatBruker.parse_header(FormatBruker.read_header_lines(image_path))
+        if hdr.get("FORMAT") != "100":
+            return None
+        nrows = int(hdr["NROWS"].split()[0])
+        ncols = int(hdr["NCOLS"].split()[0])
+        n_u, n_2o, n_4o = (int(e) for e in hdr["NOVERFL"].split())
+        npixelb = [int(e) for e in hdr["NPIXELB"].split()]
+        baseline = int(hdr["NEXP"].split()[2]) if n_u != -1 else 0
+        with open(image_path, "rb") as f:
+            f.read(int(hdr["HDRBLKS"]) * 512)
+            dt = np.uint8 if npixelb[0] == 1 else np.uint16
+            raw = np.frombuffer(f.read(nrows * ncols * npixelb[0]), dtype=dt).astype(np.float64)
+            u_vals = (
+                np.frombuffer(f.read((n_u + 15) & ~15), dtype=np.uint8)[:n_u].astype(np.float64)
+                if n_u > 0
+                else None
+            )
+            o2_vals = (
+                np.frombuffer(f.read((n_2o * 2 + 15) & ~15), dtype=np.uint16)[:n_2o].astype(
+                    np.float64
+                )
+                if n_2o > 0
+                else None
+            )
+            o4_vals = (
+                np.frombuffer(f.read((n_4o * 4 + 15) & ~15), dtype=np.uint32)[:n_4o].astype(
+                    np.float64
+                )
+                if n_4o > 0
+                else None
+            )
+        zero_mask = raw == 0
+        if o2_vals is not None:
+            raw[raw == 255] = o2_vals
+        if o4_vals is not None:
+            raw[raw == 65535] = o4_vals
+        if n_u != -1:
+            raw += float(baseline)
+        if u_vals is not None:
+            raw[zero_mask] = u_vals
+        return raw.reshape((nrows, ncols)), float(baseline)
+    except Exception:
+        return None
+
+
 def extract_dxtbx_tile(
     source: object,
     panel_id: int = 0,
@@ -329,10 +383,30 @@ def extract_dxtbx_tile(
     images = np.empty((indices.size, th, tw), dtype=np.float64)
     untrusted_mask = np.zeros((th, tw), dtype=bool)
 
+    fmt_class = imageset.get_format_class()
+    is_bruker_modern = (
+        fmt_class is not None and fmt_class.__name__ == "FormatBrukerModern" and panel_id == 0
+    )
+    bruker_pedestal: float | None = None
+
     for out_idx, img_idx in enumerate(indices):
-        raw_tuple = imageset.get_raw_data(int(img_idx))
-        raw_panel = raw_tuple[panel_id].as_numpy_array()
-        images[out_idx] = raw_panel[y0:y1, x0:x1].astype(np.float64, copy=False)
+        bruker_res = None
+        if is_bruker_modern:
+            try:
+                img_path = imageset.get_path(int(img_idx))
+                bruker_res = _read_bruker_format100_panel(img_path)
+            except Exception:
+                bruker_res = None
+
+        if bruker_res is not None:
+            raw_panel, b_ped = bruker_res
+            images[out_idx] = raw_panel[y0:y1, x0:x1]
+            if bruker_pedestal is None:
+                bruker_pedestal = b_ped
+        else:
+            raw_tuple = imageset.get_raw_data(int(img_idx))
+            raw_panel = raw_tuple[panel_id].as_numpy_array()
+            images[out_idx] = raw_panel[y0:y1, x0:x1].astype(np.float64, copy=False)
 
         mask_tuple = imageset.get_mask(int(img_idx))
         mask_panel = mask_tuple[panel_id].as_numpy_array()
@@ -348,6 +422,11 @@ def extract_dxtbx_tile(
 
     trusted = panel.get_trusted_range()
     px_size = panel.get_pixel_size()
+    effective_pedestal = (
+        float(bruker_pedestal)
+        if (bruker_pedestal is not None and float(panel.get_pedestal()) == 0.0)
+        else float(panel.get_pedestal())
+    )
     return DxtbxTileData(
         images=images,
         static_untrusted_mask=untrusted_mask,
@@ -355,7 +434,7 @@ def extract_dxtbx_tile(
         panel_id=panel_id,
         panel_name=str(panel.get_name()),
         detector_gain=float(panel.get_gain()),
-        detector_pedestal=float(panel.get_pedestal()),
+        detector_pedestal=effective_pedestal,
         trusted_range=(float(trusted[0]), float(trusted[1])),
         bbox_yx=(y0, y1, x0, x1),
         panel_shape_yx=(panel_height, panel_width),

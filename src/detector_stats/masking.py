@@ -201,7 +201,10 @@ def detect_static_bad_pixels(
                 | np.all(np.abs(images) <= 1e-6 * q_scale, axis=0)
             )
         )
-        | (temp_mean < config.dead_pixel_rel_threshold * local_med_5)
+        | (
+            (local_med_5 > max(3.0 * read_sigma_est, 2.0 * q_scale))
+            & (temp_mean < config.dead_pixel_rel_threshold * local_med_5)
+        )
     )
     # Also catch pixels pinned at raw 0.0 when pedestal > 0 or local neighborhood is active
     pinned_zero = np.all(np.abs(images) <= 1e-6 * q_scale, axis=0) & active_neighborhood

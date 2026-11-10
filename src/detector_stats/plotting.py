@@ -464,7 +464,7 @@ def plot_representative_frame_and_masks(
             markersize=5.5,
             label="Hot/dead px (static)",
         ),
-        Patch(facecolor="#3a3a4a", edgecolor="white", linewidth=0.5, label="Shadowed border"),
+        Patch(facecolor="#3a3a4a", edgecolor="white", linewidth=0.5, label="Static shadow/corner"),
     ]
     ax.legend(handles=handles, loc="upper right", fontsize=7.2, framealpha=0.88)
     ax.set_xlabel("Pixel $x$", fontsize=9.5)
