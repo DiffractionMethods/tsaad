@@ -127,7 +127,17 @@ def load_imageset(source: object):
         imagesets = expts.imagesets()
         if not imagesets:
             raise ValueError(f"No imagesets found in {source!r}.")
-        return sorted(imagesets, key=lambda ims: len(ims), reverse=True)[0]
+        best = sorted(imagesets, key=lambda ims: len(ims), reverse=True)[0]
+        if len(paths) >= 4 and len(best) < 4:
+            try:
+                from dxtbx.imageset import ImageSetFactory
+
+                fallback_ims = ImageSetFactory.make_imageset(paths)
+                if len(fallback_ims) > len(best):
+                    return fallback_ims
+            except Exception:
+                pass
+        return best
 
     raise TypeError(f"Unsupported dxtbx source type: {type(source)!r}")
 
