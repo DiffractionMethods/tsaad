@@ -202,8 +202,9 @@ def detect_static_bad_pixels(
             )
         )
         | (
-            (local_med_5 > max(3.0 * read_sigma_est, 2.0 * q_scale))
+            (local_med_5 > max(6.0 * read_sigma_est, 2.0 * q_scale))
             & (temp_mean < config.dead_pixel_rel_threshold * local_med_5)
+            & (temp_var < 0.5 * local_var_med)
         )
     )
     # Also catch pixels pinned at raw 0.0 when pedestal > 0 or local neighborhood is active
