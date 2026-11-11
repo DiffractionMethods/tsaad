@@ -106,23 +106,25 @@ def compute_quality_diagnostics(
         else 0.0
     )
 
-    # Scale-covariant minimum intensity floor so standardized_residual_std is c^0 invariant
+    # Scale-covariant active-variance floor so standardized_residual_std is c^0 invariant:
+    # excludes exact zero-variance dark PAD voxels (mu == 0, psi == 0) while retaining all
+    # positive-variance readout-noise voxels when psi > 0.
     ped_offset = float(cov.estimated_pedestal_offset)
     g0 = max(float(cov.apparent_single_pixel_gain), 0.0)
     psi_val = max(float(cov.psi), 0.0)
     scale_unit = max(g0, float(np.sqrt(psi_val)), 1e-12)
-    mu_floor = 0.5 * scale_unit
+    min_active_var = (0.25 * max(g0, 1e-12)) ** 2
 
-    mu_shifted = trend.expected_intensity + ped_offset
-    eval_mask = trend.valid_mask & (mu_shifted >= mu_floor)
+    mu_shifted = np.maximum(trend.expected_intensity + ped_offset, 0.0)
+    pred_var = g0 * mu_shifted + psi_val
+    eval_mask = trend.valid_mask & (pred_var >= min_active_var)
     if np.count_nonzero(eval_mask) < 64:
         eval_mask = trend.valid_mask
 
     if np.any(eval_mask):
         res_eval = trend.residuals[eval_mask]
-        mu_eval = np.maximum(mu_shifted[eval_mask], 1e-6 * scale_unit)
         var_floor = (1e-3 * scale_unit) ** 2
-        sigma_px = np.sqrt(np.maximum(g0 * mu_eval + psi_val, var_floor))
+        sigma_px = np.sqrt(np.maximum(pred_var[eval_mask], var_floor))
         z = res_eval / sigma_px
         tail_frac = float(np.mean(np.abs(z) > 3.5))
         z_clip = z[(z >= -5.0) & (z <= 5.0)]
@@ -134,11 +136,17 @@ def compute_quality_diagnostics(
     warn_list: list[str] = []
     critical_fail = False
 
-    if not np.isfinite(z_std) or abs(z_std - 1.0) > 0.12 or tail_frac > 0.015:
+    if not np.isfinite(z_std) or z_std > 1.12 or tail_frac > 0.015:
         warn_list.append(
             f"non_gaussian_residuals: standardized residual SD={z_std:.3f}, "
             f"|z|>3.5 tail={100.0 * tail_frac:.2f}% "
             "(possible unmasked overlapping Bragg or diffuse scattering contamination)"
+        )
+        critical_fail = True
+    elif z_std < 0.85:
+        warn_list.append(
+            f"underdispersed_residuals: standardized residual SD={z_std:.3f} < 0.85 "
+            "(possible readout noise overestimation or temporal smoothing)"
         )
         critical_fail = True
 
