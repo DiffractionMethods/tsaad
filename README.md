@@ -1,4 +1,4 @@
-# detector_stats
+# tsaad — Time Series Analysis of Area Detectors
 
 Calibration-free estimation of detector response statistics—absorbed quantum gain ($G$), cascade factor ($\gamma$), and pixel noise factor ($\psi$)—directly from diffraction rotation-scan datasets.
 
@@ -10,7 +10,7 @@ $$\sigma_p^2 = \bar{p} \, G \gamma + N \psi$$
 
 Local single-frame dispersion estimators (such as `dials.estimate_gain`) underestimate the true response product $G\gamma$ whenever a point-spread function (PSF) or charge-sharing kernel $K(\mathbf{u})$ introduces spatial correlations between neighboring pixels, damping single-pixel variance by the zero-lag PSF autocorrelation factor $S_2 = \alpha(\mathbf{0}) = \sum_{\mathbf{v}} K(\mathbf{v})^2 < 1$.
 
-`detector_stats` treats a rotation scan as an ensemble of coupled pixel time series to separate smooth spatiotemporal background trends and transient outliers (Bragg reflections, cosmic-ray zingers) from stochastic detector fluctuations, recovering $(G, \gamma, \psi)$ and the spatial autocorrelation kernel $\alpha(\mathbf{u})$ via lag-summed spatial cross-covariance across intensity regimes.
+`tsaad` (*Time Series Analysis of Area Detectors*) treats a rotation scan as an ensemble of coupled pixel time series to separate smooth spatiotemporal background trends and transient outliers (Bragg reflections, cosmic-ray zingers) from stochastic detector fluctuations, recovering $(G, \gamma, \psi)$ and the spatial autocorrelation kernel $\alpha(\mathbf{u})$ via lag-summed spatial cross-covariance across intensity regimes.
 
 ---
 
@@ -18,18 +18,17 @@ Local single-frame dispersion estimators (such as `dials.estimate_gain`) underes
 
 ### Standalone Design (No Dependency on DIALS)
 
-`detector_stats` is designed as a **standalone package independent of DIALS** so that users and external pipelines without a full DIALS installation can install and use it directly:
-- **Core package (`detector_stats`):** Pure Python, depending **only on `numpy` and `scipy`** (with `matplotlib` for diagnostic plotting).
-- **`dxtbx` integration (`detector_stats.dxtbx_loader`):** Optionally depends on `dxtbx` to read diffraction image formats, `.expt` files, `ImageSet`s, and detector `Panel` models, and replicates the single-frame Kabsch local dispersion baseline (`dials.estimate_gain`) in pure NumPy without importing `dials`.
-- **Future `conda-forge` & DIALS Integration:** Because `detector_stats` depends only on `numpy`, `scipy`, `matplotlib`, and (optionally) `dxtbx`—and never on `dials`—it can be packaged on `conda-forge` without circular dependencies. Downstream DIALS builds can then install `detector-stats` from `conda-forge` and import it directly inside a replacement implementation of `dials.estimate_gain`.
+`tsaad` is designed as a **standalone package independent of DIALS** so that users and external pipelines without a full DIALS installation can install and use it directly:
+- **Core package (`tsaad`):** Pure Python, depending **only on `numpy` and `scipy`** (with `matplotlib` optional for diagnostic plotting).
+- **`dxtbx` integration (`tsaad.dxtbx_loader`):** Optionally depends on `dxtbx` to read diffraction image formats, `.expt` files, `ImageSet`s, and detector `Panel` models, and replicates the single-frame Kabsch local dispersion baseline (`dials.estimate_gain`) in pure NumPy without importing `dials`.
+- **Future `conda-forge` & DIALS Integration:** Because `tsaad` depends only on `numpy`, `scipy`, `matplotlib`, and (optionally) `dxtbx`—and never on `dials`—it can be packaged on `conda-forge` without circular dependencies. Downstream DIALS builds can then install `tsaad` from `conda-forge` and import it directly inside a replacement implementation of `dials.estimate_gain`.
 
 ### Installing into a Standard Python Environment
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
-pip install pytest
+pip install -e ".[plot,dev]"
 ```
 
 ### Installing into an Existing DIALS Environment
@@ -46,9 +45,9 @@ libtbx.pip install -e .
 
 ---
 
-## Simulator Usage (`detector_stats.simulator`)
+## Simulator Usage (`tsaad.simulator`)
 
-The `detector_stats.simulator` module generates synthetic diffraction rotation-scan image stacks $\mathbf{Y}(\mathbf{x}, t)$ with exact ground-truth detector response statistics $(G, \gamma, \psi)$, 2D point-spread kernels $K(\mathbf{u})$, non-stationary incident beam flux $I_0(t)$, radially varying and rotating background scatter, transient 3D Bragg reflections, single-frame cosmic-ray zingers, and static bad/shadowed pixels.
+The `tsaad.simulator` module generates synthetic diffraction rotation-scan image stacks $\mathbf{Y}(\mathbf{x}, t)$ with exact ground-truth detector response statistics $(G, \gamma, \psi)$, 2D point-spread kernels $K(\mathbf{u})$, non-stationary incident beam flux $I_0(t)$, radially varying and rotating background scatter, transient 3D Bragg reflections, single-frame cosmic-ray zingers, and static bad/shadowed pixels.
 
 ### 1. Simulating a Rotation Scan with Built-in Detector Presets
 
@@ -59,7 +58,7 @@ Three benchmark detector presets are provided out of the box:
 - `DetectorConfig.ed_pad_timepix()`: Hybrid PAD operated in 200 keV 3D electron diffraction mode after Vypritskaia et al. (2025) ($G = 2.9$, $\gamma = 1.35$, $\psi = 0.0$, discrete multi-pixel charge-sharing cluster PSF with $S_2 \approx 0.455$).
 
 ```python
-from detector_stats.simulator import (
+from tsaad.simulator import (
     DetectorConfig,
     SceneConfig,
     simulate_rotation_scan,
@@ -116,7 +115,7 @@ print("Apparent single-pixel dispersion slope:", detector.apparent_single_pixel_
 You can construct custom detectors with analytical or empirical 2D PSF kernels (`delta_psf`, `gaussian_psf`, `lorentzian_psf`, `timepix_cluster_psf`, or any normalized 2D NumPy array with odd dimensions) and query their theoretical spatial autocovariance:
 
 ```python
-from detector_stats.simulator import DetectorConfig, gaussian_psf
+from tsaad.simulator import DetectorConfig, gaussian_psf
 
 custom_detector = DetectorConfig(
     name="custom_cmos",
@@ -137,12 +136,12 @@ cov_matrix = custom_detector.theoretical_covariance_kernel(mu_adu=50.0)
 
 ---
 
-## Estimating Detector Response Statistics (`detector_stats.pipeline`)
+## Estimating Detector Response Statistics (`tsaad.pipeline`)
 
 Use `estimate_detector_statistics` to run the complete four-stage pipeline (anomaly masking $\rightarrow$ spatiotemporal detrending $\rightarrow$ lagged cross-covariance regression $\rightarrow$ $G$/$\gamma$ separation) on any 3D rotation-scan image stack `(n_frames, height, width)`:
 
 ```python
-from detector_stats import (
+from tsaad import (
     DetectorConfig,
     SceneConfig,
     estimate_detector_statistics,
@@ -167,6 +166,7 @@ print(f"Estimated gain G    : {report.gain:.3f} (method: {report.separation.sepa
 print(f"Estimated cascade γ : {report.cascade_factor:.3f}")
 print(f"Estimated noise ψ   : {report.psi:.3f} +- {report.covariance.psi_se:.3f}")
 print(f"Detected PSF radius : {report.psf_radius} px (S_2 = {report.s2_factor:.3f})")
+print(f"Quality reliable    : {report.quality.is_reliable} (warnings: {report.quality.warnings})")
 
 # Save an 8-panel diagnostic summary figure
 plot_detector_stats_report(
@@ -180,6 +180,19 @@ plot_detector_stats_report(
 
 ---
 
+## Command-Line Interface (`tsaad`)
+
+After installing the package, run `tsaad` on a `.npy` / `.npz` 3D stack, a `dxtbx` `.expt` file, or diffraction image files/directories:
+
+```bash
+tsaad /path/to/scan_or_stack \
+    --max-frames 80 \
+    --json summary.json \
+    --plot diagnostic_report.png
+```
+
+---
+
 ## Running Tests
 
 Run the test suite with `pytest`:
@@ -188,6 +201,12 @@ Run the test suite with `pytest`:
 # Using a standard Python environment:
 pytest
 
-# Or using DIALS's conda_base pytest (includes the DIALS DispersionThresholdDebug comparison test):
+# Or using DIALS's conda_base pytest (includes dxtbx & DIALS dispersion baseline tests):
 /path/to/dials/conda_base/bin/pytest -v
 ```
+
+---
+
+## License
+
+`tsaad` is distributed under the terms of the [BSD 3-Clause License](LICENSE).

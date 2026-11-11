@@ -1,26 +1,28 @@
-"""Tests for diagnostic plotting utilities in detector_stats.plotting."""
+"""Tests for diagnostic plotting utilities and CLI output in tsaad."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import matplotlib
 import numpy as np
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # noqa: E402
 
-from detector_stats import (
+from tsaad import (  # noqa: E402
     DetectorConfig,
     SceneConfig,
     estimate_detector_statistics,
     plot_detector_stats_report,
     simulate_rotation_scan,
 )
+from tsaad.cli import main as cli_main  # noqa: E402
 
 
 def test_plot_detector_stats_report_pt_ccd(tmp_path: Path) -> None:
-    """Verify 6-panel figure generation and saving for a p-t-CCD simulation."""
+    """Verify 8-panel figure generation and saving for a p-t-CCD simulation."""
     det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
     scene = SceneConfig(n_frames=30, height=72, width=72, n_bragg_spots=30, n_zingers=5)
     sim = simulate_rotation_scan(det, scene, seed=42)
@@ -43,7 +45,7 @@ def test_plot_detector_stats_report_pt_ccd(tmp_path: Path) -> None:
 
 
 def test_plot_detector_stats_report_timepix_sparse_clusters(tmp_path: Path) -> None:
-    """Verify 6-panel figure generation when sparse single-event cluster histogram is active."""
+    """Verify 8-panel figure generation when sparse single-event cluster histogram is active."""
     det = DetectorConfig.ed_pad_timepix(gain=2.9, cascade_factor=1.35)
     scene = SceneConfig(
         n_frames=40,
@@ -73,3 +75,35 @@ def test_plot_detector_stats_report_timepix_sparse_clusters(tmp_path: Path) -> N
         assert out_png.stat().st_size > 10_000
     finally:
         plt.close(fig)
+
+
+def test_cli_npy_json_and_plot(tmp_path: Path) -> None:
+    """Verify the `tsaad` CLI entrypoint on a 3D `.npy` stack."""
+    det = DetectorConfig.ideal_pad()
+    scene = SceneConfig(n_frames=24, height=64, width=64, n_bragg_spots=15)
+    sim = simulate_rotation_scan(det, scene, seed=11)
+
+    npy_path = tmp_path / "scan.npy"
+    json_path = tmp_path / "report.json"
+    png_path = tmp_path / "report.png"
+    np.save(npy_path, sim.images.astype(np.float32))
+
+    rc = cli_main(
+        [
+            str(npy_path),
+            "--pedestal",
+            "0.0",
+            "--max-lag",
+            "4",
+            "--json",
+            str(json_path),
+            "--plot",
+            str(png_path),
+        ]
+    )
+    assert rc == 0
+    assert json_path.exists()
+    assert png_path.exists() and png_path.stat().st_size > 10_000
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert abs(payload["g_gamma"] - 1.0) < 0.05
+    assert payload["quality"]["is_reliable"] is True

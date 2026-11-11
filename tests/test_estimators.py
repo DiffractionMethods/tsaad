@@ -5,9 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from detector_stats import (
+from tsaad import (
     DetectorConfig,
     SceneConfig,
+    SimulationResult,
+    TrendMethodName,
     delta_psf,
     detect_static_bad_pixels,
     detect_transient_outliers,
@@ -17,6 +19,63 @@ from detector_stats import (
     lorentzian_psf,
     simulate_rotation_scan,
 )
+
+
+@pytest.fixture(scope="module")
+def ideal_pad_sim() -> SimulationResult:
+    det = DetectorConfig.ideal_pad()
+    scene = SceneConfig(
+        n_frames=60,
+        height=128,
+        width=128,
+        n_bragg_spots=80,
+        n_zingers=15,
+        n_hot_pixels=10,
+        n_dead_pixels=10,
+        shadow_margin_px=4,
+    )
+    return simulate_rotation_scan(det, scene, seed=42)
+
+
+@pytest.fixture(scope="module")
+def pt_ccd_sim() -> SimulationResult:
+    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
+    scene = SceneConfig(
+        n_frames=60,
+        height=128,
+        width=128,
+        n_bragg_spots=80,
+        n_zingers=15,
+        n_hot_pixels=10,
+        n_dead_pixels=10,
+        shadow_margin_px=4,
+    )
+    return simulate_rotation_scan(det, scene, seed=42)
+
+
+@pytest.fixture(scope="module")
+def ed_timepix_sim() -> SimulationResult:
+    det = DetectorConfig.ed_pad_timepix()
+    scene = SceneConfig(
+        n_frames=60,
+        height=128,
+        width=128,
+        include_sparse_corner=True,
+        sparse_corner_quanta=0.008,
+        n_bragg_spots=80,
+        n_zingers=15,
+        n_hot_pixels=10,
+        n_dead_pixels=10,
+        shadow_margin_px=4,
+    )
+    return simulate_rotation_scan(det, scene, seed=42)
+
+
+@pytest.fixture(scope="module")
+def pedestal_calib_sim() -> SimulationResult:
+    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
+    scene = SceneConfig(n_frames=50, height=112, width=112, n_bragg_spots=60)
+    return simulate_rotation_scan(det, scene, seed=42)
 
 
 def test_masking_static_and_transient_anomalies() -> None:
@@ -80,7 +139,9 @@ def test_incident_flux_scale_recovery() -> None:
     y_sub = sim.images - det.pedestal
     flux_est, _ = estimate_incident_flux_scale(y_sub, mask_res.valid_mask)
 
-    rel_rms_err = float(np.sqrt(np.mean(((flux_est - sim.incident_flux_scale) / sim.incident_flux_scale) ** 2)))
+    rel_rms_err = float(
+        np.sqrt(np.mean(((flux_est - sim.incident_flux_scale) / sim.incident_flux_scale) ** 2))
+    )
     assert rel_rms_err < 0.01
 
 
@@ -88,22 +149,13 @@ def test_incident_flux_scale_recovery() -> None:
     "trend_method",
     ["hollow_stencil_kriging", "low_rank_spline", "temporal_difference"],
 )
-def test_ideal_pad_parameter_recovery(trend_method: str) -> None:
+def test_ideal_pad_parameter_recovery(
+    ideal_pad_sim: SimulationResult, trend_method: TrendMethodName
+) -> None:
     """Test 1 (Ideal PAD): Verify |G*gamma - 1.0| < 0.02, |psi| < 0.05, r_PSF == 0."""
-    det = DetectorConfig.ideal_pad()
-    scene = SceneConfig(
-        n_frames=60,
-        height=128,
-        width=128,
-        n_bragg_spots=80,
-        n_zingers=15,
-        n_hot_pixels=10,
-        n_dead_pixels=10,
-        shadow_margin_px=4,
-    )
-    sim = simulate_rotation_scan(det, scene, seed=42)
+    det = ideal_pad_sim.detector_config
     rep = estimate_detector_statistics(
-        sim.images, pedestal=det.pedestal, trend_method=trend_method  # type: ignore[arg-type]
+        ideal_pad_sim.images, pedestal=det.pedestal, trend_method=trend_method
     )
 
     assert abs(rep.g_gamma - 1.0) < 0.02
@@ -120,22 +172,13 @@ def test_ideal_pad_parameter_recovery(trend_method: str) -> None:
     "trend_method",
     ["hollow_stencil_kriging", "low_rank_spline", "temporal_difference"],
 )
-def test_pt_ccd_waterman_evans_parameter_recovery(trend_method: str) -> None:
+def test_pt_ccd_waterman_evans_parameter_recovery(
+    pt_ccd_sim: SimulationResult, trend_method: TrendMethodName
+) -> None:
     """Test 2 (p-t-CCD with PSF & Beam Drift): Verify recovery of G*gamma = 2.22 and psi = 9.08."""
-    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
-    scene = SceneConfig(
-        n_frames=60,
-        height=128,
-        width=128,
-        n_bragg_spots=80,
-        n_zingers=15,
-        n_hot_pixels=10,
-        n_dead_pixels=10,
-        shadow_margin_px=4,
-    )
-    sim = simulate_rotation_scan(det, scene, seed=42)
+    det = pt_ccd_sim.detector_config
     rep = estimate_detector_statistics(
-        sim.images, pedestal=det.pedestal, trend_method=trend_method  # type: ignore[arg-type]
+        pt_ccd_sim.images, pedestal=det.pedestal, trend_method=trend_method
     )
 
     # Zero-lag single-pixel slope is damped by S_2 ~= 0.19 (reporting ~0.42 instead of 2.22)
@@ -162,24 +205,13 @@ def test_pt_ccd_waterman_evans_parameter_recovery(trend_method: str) -> None:
     "trend_method",
     ["hollow_stencil_kriging", "low_rank_spline", "temporal_difference"],
 )
-def test_ed_pad_timepix_sparse_cluster_separation(trend_method: str) -> None:
+def test_ed_pad_timepix_sparse_cluster_separation(
+    ed_timepix_sim: SimulationResult, trend_method: TrendMethodName
+) -> None:
     """Test 3 (3D ED Timepix PAD): Verify separate recovery of G = 2.9 and gamma = 1.35."""
-    det = DetectorConfig.ed_pad_timepix()
-    scene = SceneConfig(
-        n_frames=60,
-        height=128,
-        width=128,
-        include_sparse_corner=True,
-        sparse_corner_quanta=0.008,
-        n_bragg_spots=80,
-        n_zingers=15,
-        n_hot_pixels=10,
-        n_dead_pixels=10,
-        shadow_margin_px=4,
-    )
-    sim = simulate_rotation_scan(det, scene, seed=42)
+    det = ed_timepix_sim.detector_config
     rep = estimate_detector_statistics(
-        sim.images, pedestal=det.pedestal, trend_method=trend_method  # type: ignore[arg-type]
+        ed_timepix_sim.images, pedestal=det.pedestal, trend_method=trend_method
     )
 
     assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.03)
@@ -361,15 +393,13 @@ def test_adc_integer_quantization() -> None:
 
 
 @pytest.mark.parametrize("pedestal_error_adu", [-5.0, +5.0])
-def test_pedestal_offset_self_calibration(pedestal_error_adu: float) -> None:
+def test_pedestal_offset_self_calibration(
+    pedestal_calib_sim: SimulationResult, pedestal_error_adu: float
+) -> None:
     """Verify that off-diagonal PSF covariance self-calibrates additive pedestal errors."""
-    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=50.0, psf_radius=3)
-    scene = SceneConfig(n_frames=50, height=112, width=112, n_bragg_spots=60)
-    sim = simulate_rotation_scan(det, scene, seed=42)
-
+    det = pedestal_calib_sim.detector_config
     rep = estimate_detector_statistics(
-        sim.images, pedestal=det.pedestal + pedestal_error_adu
+        pedestal_calib_sim.images, pedestal=det.pedestal + pedestal_error_adu
     )
     assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.05)
     assert np.isclose(rep.psi, det.pixel_factor, atol=0.70)
-

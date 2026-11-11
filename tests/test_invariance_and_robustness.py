@@ -1,14 +1,18 @@
-"""Invariance, robustness, and edge-case tests for the detector_stats hardening pass."""
+"""Invariance, robustness, and edge-case tests for the tsaad hardening pass."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from detector_stats import (
+from tsaad import (
+    CovarianceConfig,
     DetectorConfig,
+    HollowStencilKrigingTrend,
     MaskingConfig,
     SceneConfig,
+    SeparationConfig,
+    TrendResult,
     detect_transient_outliers,
     estimate_detector_statistics,
     gaussian_psf,
@@ -73,6 +77,11 @@ def test_exact_multiplicative_scale_invariance() -> None:
         assert res_scaled.covariance.psi_se == pytest.approx(
             (scale**2) * res_base.covariance.psi_se, rel=5e-4, abs=1e-6
         )
+        assert res_base.quality is not None and res_scaled.quality is not None
+        assert res_scaled.quality.standardized_residual_std == pytest.approx(
+            res_base.quality.standardized_residual_std, rel=1e-4
+        )
+        assert res_scaled.quality.is_reliable == res_base.quality.is_reliable
 
 
 def test_psf_guard_band_auto_expansion() -> None:
@@ -114,7 +123,7 @@ def test_pedestal_offset_diagnostic_and_opt_out() -> None:
     scene = SceneConfig(n_frames=36, height=96, width=96, n_bragg_spots=30)
     sim = simulate_rotation_scan(det, scene, seed=606)
 
-    # Pass an intentionally under-subtracted pedestal (45.0 instead of 50.0 -> bin_means are +5 ADU too high,
+    # Pass an intentionally under-subtracted pedestal (45.0 vs 50.0 -> bin_means +5 ADU too high,
     # so the required additive correction delta_p0 to true intensity is -5.0 ADU)
     res_auto = estimate_detector_statistics(
         sim.images,
@@ -154,7 +163,7 @@ def test_non_integer_sparse_cluster_wing_integration() -> None:
         pixel_factor=0.02,
         pedestal=0.0,
         psf_kernel=gaussian_psf(sigma_px=0.65, radius=2),
-        psf_mode="discrete_multinomial",
+        psf_mode="discrete_cluster",
         quantize=False,
     )
     scene = SceneConfig(
@@ -339,3 +348,119 @@ def test_janesick_quadratic_halo_excess_variance_guard() -> None:
     assert res.psf_radius == 0
     assert res.s2_factor == pytest.approx(1.0, abs=1e-6)
     assert res.g_gamma == pytest.approx(1.0, abs=0.08)
+
+
+def test_nan_inf_and_invalid_shape_handling() -> None:
+    """Verify input validation errors and automatic masking of isolated/static NaN/Inf pixels."""
+    with pytest.raises(ValueError, match="3D image stack"):
+        estimate_detector_statistics(np.ones((64, 64)))
+    with pytest.raises(ValueError, match="at least 2 frames"):
+        estimate_detector_statistics(np.ones((1, 32, 32)))
+    with pytest.raises(ValueError, match="at least \\(8, 8\\)"):
+        estimate_detector_statistics(np.ones((10, 6, 32)))
+    with pytest.raises(ValueError, match="pedestal must be finite"):
+        estimate_detector_statistics(np.ones((10, 32, 32)), pedestal=float("nan"))
+
+    det = DetectorConfig.pt_ccd_waterman_evans(pedestal=40.0, psf_radius=3)
+    scene = SceneConfig(n_frames=32, height=88, width=88, n_bragg_spots=20)
+    sim = simulate_rotation_scan(det, scene, seed=303)
+
+    corrupted = sim.images.copy()
+    # Static all-frame NaN pixel + isolated single-frame NaN and +Inf voxels
+    corrupted[:, 20, 20] = np.nan
+    corrupted[5, 40, 45] = np.nan
+    corrupted[12, 55, 35] = np.inf
+
+    rep = estimate_detector_statistics(
+        corrupted, pedestal=det.pedestal, max_lag=4, trusted_range=(0.0, 65535.0)
+    )
+    assert bool(rep.masking.static_bad_mask[20, 20]) is True
+    assert bool(rep.masking.transient_outlier_mask[5, 40, 45]) is True
+    assert bool(rep.masking.transient_outlier_mask[12, 55, 35]) is True
+    assert np.all(np.isfinite(rep.trend.residuals))
+    assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.08)
+    assert np.isclose(rep.psi, det.pixel_factor, atol=0.80)
+
+
+def test_quality_diagnostics_flags_contaminated_scan() -> None:
+    """Clean scans report is_reliable=True, whereas severe unmasked overdispersion is flagged."""
+    det = DetectorConfig.ideal_pad()
+    scene = SceneConfig(n_frames=30, height=80, width=80, n_bragg_spots=20)
+    sim = simulate_rotation_scan(det, scene, seed=414)
+    clean_rep = estimate_detector_statistics(sim.images, pedestal=0.0, max_lag=4)
+    assert clean_rep.quality is not None
+    assert clean_rep.quality.is_reliable is True
+    assert abs(clean_rep.quality.standardized_residual_std - 1.0) < 0.10
+
+    # Inject spatially localized heavy Bragg/diffuse clutter on 35% of pixels (mimicking 3rsi)
+    rng = np.random.default_rng(415)
+    noisy = sim.images.copy()
+    noisy[:, :30, :40] += rng.choice([0.0, 45.0], p=[0.65, 0.35], size=(30, 30, 40))
+    bad_rep = estimate_detector_statistics(
+        noisy,
+        pedestal=0.0,
+        max_lag=4,
+        masking_config=MaskingConfig(transient_seed_sigma=50.0, transient_cluster_sigma=50.0),
+    )
+    assert bad_rep.quality is not None
+    assert bad_rep.quality.is_reliable is False
+    assert any("non_gaussian_residuals" in w for w in bad_rep.quality.warnings)
+
+
+def test_boundary_bragg_spot_and_scan_step_no_wrap_artifact() -> None:
+    """Endpoint-median temporal padding must mask a Bragg spot at t=0 without wrapping t=T-1."""
+    rng = np.random.default_rng(515)
+    n_t, ny, nx = 30, 64, 64
+    t_norm = np.linspace(0.0, 1.0, n_t)[:, None, None]
+    # Anisotropic rotation: top half goes 45 -> 10 ADU while bottom half goes 10 -> 45 ADU
+    # (global flux stays constant, so mode='wrap' would pull t=0 top-half median down and
+    # falsely mask >50% of the top half at t=0!)
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    top_half = yy < (ny // 2)
+    lam = np.where(
+        top_half[None, :, :],
+        45.0 - 35.0 * t_norm,
+        10.0 + 35.0 * t_norm,
+    )
+    y = rng.poisson(lam).astype(np.float64)
+
+    # Place a bright Bragg spot directly on frame t=0 at (48, 32)
+    spot_r2 = (yy - 48.0) ** 2 + (xx - 32.0) ** 2
+    y[0] += 220.0 * np.exp(-0.5 * spot_r2 / (1.2**2))
+
+    mask_res = detect_transient_outliers(y, pedestal=0.0)
+    # Spot core at t=0 must be masked
+    assert bool(mask_res.transient_outlier_mask[0, 48, 32]) is True
+    # Top half at t=0 must NOT suffer false masking from wrapping t=T-1 (10 ADU) onto t=0 (45 ADU)
+    assert float(np.mean(mask_res.transient_outlier_mask[0, top_half])) < 0.05
+
+
+def test_custom_trend_estimator_and_config_dataclasses() -> None:
+    """Verify passing custom TrendEstimator instances and Covariance/Separation configs."""
+    det = DetectorConfig.ideal_pad()
+    scene = SceneConfig(n_frames=28, height=72, width=72, n_bragg_spots=15)
+    sim = simulate_rotation_scan(det, scene, seed=616)
+
+    custom_kriging = HollowStencilKrigingTrend(temporal_sigma_frames=2.0)
+    rep1 = estimate_detector_statistics(
+        sim.images,
+        pedestal=0.0,
+        trend_method=custom_kriging,
+        covariance_config=CovarianceConfig(temporal_chunk_frames=8),
+        separation_config=SeparationConfig(pad_g_gamma_tol=0.15),
+    )
+    assert abs(rep1.g_gamma - 1.0) < 0.04
+
+    class _CustomWrapperTrend:
+        def fit_predict(
+            self, images: np.ndarray, valid_mask: np.ndarray, pedestal: float = 0.0
+        ) -> TrendResult:
+            res = HollowStencilKrigingTrend(temporal_sigma_frames=1.8).fit_predict(
+                images, valid_mask=valid_mask, pedestal=pedestal
+            )
+            res.method_name = "custom_wrapper"
+            return res
+
+    rep2 = estimate_detector_statistics(sim.images, pedestal=0.0, trend_method=_CustomWrapperTrend())
+    assert rep2.trend.method_name == "custom_wrapper"
+    assert abs(rep2.g_gamma - 1.0) < 0.04

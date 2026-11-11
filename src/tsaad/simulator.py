@@ -92,6 +92,10 @@ class DetectorConfig:
             raise ValueError(
                 f"pixel_factor psi must be >= 0, got {self.pixel_factor}"
             )
+        if self.psf_mode not in ("continuous", "discrete_cluster"):
+            raise ValueError(
+                f"psf_mode must be 'continuous' or 'discrete_cluster', got {self.psf_mode!r}"
+            )
         self.psf_kernel = np.asarray(self.psf_kernel, dtype=np.float64)
         if (
             self.psf_kernel.ndim != 2
@@ -258,7 +262,7 @@ class SimulationResult:
     """Container for simulated rotation-scan images and ground-truth fields."""
 
     images: np.ndarray  # (n_frames, height, width) observed ADU time series Y(y, x, t)
-    expected_background_adu: np.ndarray  # (n_frames, height, width) true background mu(y, x, t) above pedestal
+    expected_background_adu: np.ndarray  # (n_frames, height, width) true mu(y, x, t) above pedestal
     incident_flux_scale: np.ndarray  # (n_frames,) true global beam scale factor I_0(t)
     spot_mask: np.ndarray  # (n_frames, height, width) bool mask where Bragg spots / zingers are present
     static_bad_mask: np.ndarray  # (height, width) bool mask where hot/dead/shadowed pixels are located
@@ -351,7 +355,8 @@ def _sample_cascade_and_psf(
     Returns
     -------
     signal_adu : np.ndarray
-        Simulated detector signal in ADU (prior to readout noise and pedestal), shape (n_frames, height, width).
+        Simulated detector signal in ADU (prior to readout noise and pedestal),
+        shape (n_frames, height, width).
     """
     n_abs = rng.poisson(lambda_quanta)
 
@@ -434,11 +439,23 @@ def _sample_cascade_and_psf(
                 idx += 1
         # Fold reflected padding back into the interior so edge intensity is conserved
         if ry > 0:
-            padded[ry : 2 * ry, :] += padded[ry - 1 :: -1, :]
-            padded[-2 * ry : -ry, :] += padded[-1 : -ry - 1 : -1, :]
+            fy = min(ry, height)
+            top_ref = padded[:ry, :][::-1, :]
+            bot_ref = padded[ry + height :, :][::-1, :]
+            padded[ry : ry + fy, :] += top_ref[:fy, :]
+            padded[ry + height - fy : ry + height, :] += bot_ref[:fy, :]
+            if ry > fy:
+                padded[ry, :] += np.sum(top_ref[fy:, :], axis=0)
+                padded[ry + height - 1, :] += np.sum(bot_ref[fy:, :], axis=0)
         if rx > 0:
-            padded[:, rx : 2 * rx] += padded[:, rx - 1 :: -1]
-            padded[:, -2 * rx : -rx] += padded[:, -1 : -rx - 1 : -1]
+            fx = min(rx, width)
+            left_ref = padded[:, :rx][:, ::-1]
+            right_ref = padded[:, rx + width :][:, ::-1]
+            padded[:, rx : rx + fx] += left_ref[:, :fx]
+            padded[:, rx + width - fx : rx + width] += right_ref[:, :fx]
+            if rx > fx:
+                padded[:, rx] += np.sum(left_ref[:, fx:], axis=1)
+                padded[:, rx + width - 1] += np.sum(right_ref[:, fx:], axis=1)
         out[t_idx] = padded[ry : ry + height, rx : rx + width]
 
     return out

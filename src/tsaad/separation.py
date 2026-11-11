@@ -15,8 +15,21 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.ndimage import binary_dilation, find_objects, label, median_filter
 
-from detector_stats.covariance import CovarianceResult
-from detector_stats.trend import TrendResult
+from tsaad._utils import is_effectively_integer_adu, validate_and_sanitize_stack
+from tsaad.covariance import CovarianceResult
+from tsaad.trend import TrendResult
+
+
+@dataclass(frozen=True)
+class SeparationConfig:
+    """Configuration thresholds for decoupling gain G from cascade factor gamma."""
+
+    max_sparse_quanta_rate: float = 0.03
+    min_clusters: int = 40
+    max_psi_ratio_for_sparse: float = 0.25
+    pad_psi_max: float = 0.15
+    pad_g_gamma_tol: float = 0.12
+    integer_adu_tol: float = 1e-6
 
 
 @dataclass
@@ -49,6 +62,10 @@ def estimate_sparse_cluster_multiplicity(
     pedestal: float = 0.0,
     max_sparse_quanta_rate: float = 0.03,
     min_clusters: int = 40,
+    config: SeparationConfig | None = None,
+    *,
+    _precomputed_y_sub: np.ndarray | None = None,
+    _is_integer: bool | None = None,
 ) -> SeparationResult | None:
     """Attempt to separate G and gamma using isolated single-event clusters in sparse regions.
 
@@ -69,29 +86,44 @@ def estimate_sparse_cluster_multiplicity(
         Maximum incident primary rate lambda (events/pixel/frame) qualifying as sparse.
     min_clusters : int, default 40
         Minimum number of isolated single-event clusters required for a reliable estimate.
+    config : SeparationConfig, optional
+        Custom separation configuration (overrides scalar defaults when provided).
 
     Returns
     -------
     SeparationResult or None
         Separated (G, gamma, psi) if sufficient isolated clusters are found, else None.
     """
-    # Require low readout noise so individual quantum hits stand clearly above baseline noise
+    cfg = config if config is not None else SeparationConfig(
+        max_sparse_quanta_rate=max_sparse_quanta_rate,
+        min_clusters=min_clusters,
+    )
+    use_max_rate = cfg.max_sparse_quanta_rate if config is not None else max_sparse_quanta_rate
+    use_min_clusters = cfg.min_clusters if config is not None else min_clusters
+
     gg_scale = max(float(cov_result.g_gamma), 1e-12)
-    if np.sqrt(max(cov_result.psi, 0.0)) > 0.25 * gg_scale:
+    if np.sqrt(max(cov_result.psi, 0.0)) > cfg.max_psi_ratio_for_sparse * gg_scale:
         return None
 
-    y_sub = np.asarray(images, dtype=np.float64) - float(pedestal)
+    if _precomputed_y_sub is not None:
+        y_sub = _precomputed_y_sub
+    else:
+        y_sub, _ = validate_and_sanitize_stack(images, pedestal=pedestal)
+
     n_frames, height, width = y_sub.shape
     valid_2d = ~static_bad_mask
 
     # Compute 2D temporally averaged and edge-preserving spatially smoothed background rate
     p95 = np.percentile(y_sub, 95.0, axis=0)
-    y_clipped = np.minimum(y_sub, np.maximum(p95[None, :, :], 20.0 * gg_scale))
-    mean_2d = np.where(valid_2d, np.mean(y_clipped, axis=0), 1e9 * gg_scale)
+    cap_2d = np.maximum(p95, 20.0 * gg_scale)
+    sum_2d = np.zeros((height, width), dtype=np.float64)
+    for t in range(n_frames):
+        sum_2d += np.minimum(y_sub[t], cap_2d)
+    mean_2d = np.where(valid_2d, sum_2d / float(n_frames), 1e9 * gg_scale)
     smooth_mean_2d = median_filter(mean_2d, size=5, mode="nearest")
 
     approx_rate_2d = smooth_mean_2d / gg_scale
-    sparse_2d = valid_2d & (approx_rate_2d >= 0.0) & (approx_rate_2d <= max_sparse_quanta_rate)
+    sparse_2d = valid_2d & (approx_rate_2d >= 0.0) & (approx_rate_2d <= use_max_rate)
 
     # Exclude a 2-pixel border around the image perimeter so truncated edge clusters are ignored
     border_mask = np.zeros((height, width), dtype=bool)
@@ -102,8 +134,12 @@ def estimate_sparse_cluster_multiplicity(
     if n_sparse_px * n_frames < 1500:
         return None
 
-    valid_px = y_sub[:, valid_2d] if np.any(valid_2d) else y_sub
-    is_integer = bool(np.percentile(np.abs(valid_px - np.rint(valid_px)), 99.0) < 1e-6)
+    if _is_integer is not None:
+        is_integer = _is_integer
+    else:
+        valid_px = y_sub[:, valid_2d] if np.any(valid_2d) else y_sub
+        is_integer = is_effectively_integer_adu(valid_px, tol=cfg.integer_adu_tol)
+
     if is_integer and cov_result.psi < 1.0:
         hit_threshold = 0.5
     else:
@@ -125,7 +161,6 @@ def estimate_sparse_cluster_multiplicity(
         if not np.any(hits):
             continue
 
-        # Bridge 1-pixel gaps within a 3x3 single-event PSF footprint before labeling
         bridged = binary_dilation(hits, structure=bridge_struct)
         labeled, n_comp = label(bridged, structure=label_struct)
         if n_comp == 0:
@@ -142,7 +177,6 @@ def estimate_sparse_cluster_multiplicity(
                 continue
 
             hy, hx = np.nonzero(comp_hits)
-            # Reject clusters touching the boundary of the 2D sparse region
             abs_y = hy + ys.start
             abs_x = hx + xs.start
             y0, y1 = max(0, int(np.min(abs_y)) - 1), min(height, int(np.max(abs_y)) + 2)
@@ -150,7 +184,6 @@ def estimate_sparse_cluster_multiplicity(
             if not np.all(sparse_2d[y0:y1, x0:x1]):
                 continue
 
-            # Reject multi-event overlaps or Bragg reflections by bounding box span and signal cap
             span_y = int(np.max(hy) - np.min(hy)) + 1
             span_x = int(np.max(hx) - np.min(hx)) + 1
             if span_y > max_span or span_x > max_span:
@@ -159,8 +192,6 @@ def estimate_sparse_cluster_multiplicity(
             if is_integer:
                 comp_support = comp_hits
             else:
-                # For continuous PSF detectors with readout noise, integrate over the 1-px dilated
-                # cluster support inside the bounding slice so sub-threshold PSF wings are not clipped
                 comp_support = (labeled[ys, xs] == comp_idx) & sparse_2d[ys, xs]
 
             total_adu = float(np.sum(frame[ys, xs][comp_support]))
@@ -172,16 +203,14 @@ def estimate_sparse_cluster_multiplicity(
             cluster_areas.append(area)
 
     n_clusters = len(cluster_sums)
-    if n_clusters < min_clusters:
+    if n_clusters < use_min_clusters:
         return None
 
     sums_arr = np.asarray(cluster_sums, dtype=np.float64)
     areas_arr = np.asarray(cluster_areas, dtype=np.float64)
 
-    # Empirical primary event rate lambda_obs in the sparse region
     total_sparse_voxels = float(n_sparse_px * n_frames)
     lambda_obs = float(n_raw_components) / total_sparse_voxels
-    # First-order Poisson coalescence correction for compact 3x3 boxes (effective area ~9 px):
     overlap_factor = 1.0 + 4.5 * lambda_obs
 
     raw_mean_s = float(np.mean(sums_arr))
@@ -191,13 +220,10 @@ def estimate_sparse_cluster_multiplicity(
     gain_est = raw_mean_s / overlap_factor
     gain_se = float(np.std(sums_arr, ddof=1) / np.sqrt(n_clusters)) / overlap_factor
 
-    # Direct sparse cascade factor estimate: gamma_sparse = 1 + (Var(S) - N_c * psi) / G^2
     p_double = max(0.0, 1.0 - 1.0 / overlap_factor)
     var_single = max(0.0, raw_var_s - p_double * (gain_est**2) - mean_area * cov_result.psi)
     gamma_sparse = 1.0 + var_single / max(gain_est**2, 1e-12)
 
-    # Derive cascade factor gamma = (G * gamma) / G so the macroscopic product G * gamma
-    # from the full detector is exactly preserved, while reporting gamma_sparse as a diagnostic.
     gamma_from_ratio = max(1.0, float(cov_result.g_gamma / max(gain_est, 1e-12)))
     ratio_se = float(
         gamma_from_ratio
@@ -254,6 +280,9 @@ def separate_gain_and_cascade(
     cov_result: CovarianceResult,
     pedestal: float = 0.0,
     static_bad_mask: np.ndarray | None = None,
+    config: SeparationConfig | None = None,
+    *,
+    _precomputed_y_sub: np.ndarray | None = None,
 ) -> SeparationResult:
     """Decouple G and gamma when supported by the data, or apply the G=1.0 fallback rule.
 
@@ -266,10 +295,20 @@ def separate_gain_and_cascade(
        gamma = G*gamma so that downstream error estimates sigma_p^2 = p_bar*G*gamma + N*psi
        remain exact.
     """
+    cfg = config if config is not None else SeparationConfig()
     cumulant_g = estimate_cumulant_g_exploratory(trend_result, cov_result)
 
     if static_bad_mask is None:
         static_bad_mask = ~np.any(trend_result.valid_mask, axis=0)
+
+    if _precomputed_y_sub is not None:
+        y_sub = _precomputed_y_sub
+    else:
+        y_sub, _ = validate_and_sanitize_stack(images, pedestal=pedestal)
+
+    valid_2d = ~static_bad_mask
+    valid_px = y_sub[:, valid_2d] if np.any(valid_2d) else y_sub
+    is_integer = is_effectively_integer_adu(valid_px, tol=cfg.integer_adu_tol)
 
     # 1. Try sparse single-event cluster multiplicity
     sparse_res = estimate_sparse_cluster_multiplicity(
@@ -277,20 +316,20 @@ def separate_gain_and_cascade(
         static_bad_mask=static_bad_mask,
         cov_result=cov_result,
         pedestal=pedestal,
+        config=cfg,
+        _precomputed_y_sub=y_sub,
+        _is_integer=is_integer,
     )
     if sparse_res is not None:
         sparse_res.cumulant_g_estimate = cumulant_g
         return sparse_res
 
-    # 2. Check if detector is a unit-gain photon-counting PAD (integer counts, G*gamma ~= 1, psi ~= 0)
-    y_sub = np.asarray(images, dtype=np.float64) - float(pedestal)
-    valid_px = y_sub[:, ~static_bad_mask] if np.any(~static_bad_mask) else y_sub
-    is_integer = bool(np.percentile(np.abs(valid_px - np.rint(valid_px)), 99.0) < 1e-6)
+    # 2. Check if detector is a unit-gain photon-counting PAD
     if (
         is_integer
         and cov_result.psf_radius == 0
-        and cov_result.psi < 0.15
-        and abs(cov_result.g_gamma - 1.0) < 0.12
+        and cov_result.psi < cfg.pad_psi_max
+        and abs(cov_result.g_gamma - 1.0) < cfg.pad_g_gamma_tol
     ):
         return SeparationResult(
             gain=1.0,

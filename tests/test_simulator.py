@@ -2,18 +2,10 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 
-# Ensure src/ is importable
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(ROOT / "src"))
-
-from detector_stats.simulator import (
+from tsaad.simulator import (
     DetectorConfig,
     SceneConfig,
     _sample_cascade_and_psf,
@@ -185,3 +177,26 @@ def test_simulate_rotation_scan_full_scene() -> None:
     obs_bg_mean = float(np.mean(sim.images[valid_3d]))
     exp_bg_mean = float(np.mean(sim.expected_background_adu[valid_3d]) + det.pedestal)
     assert np.isclose(obs_bg_mean, exp_bg_mean, rtol=0.02)
+
+
+def test_invalid_psf_mode_and_small_frame_discrete_reflection() -> None:
+    """Validate DetectorConfig psf_mode guard and discrete_cluster photon conservation on tiny frames."""
+    with pytest.raises(ValueError, match="psf_mode"):
+        DetectorConfig(psf_mode="invalid_mode")  # type: ignore[arg-type]
+
+    det = DetectorConfig(
+        gain=1.0,
+        cascade_factor=1.0,
+        psf_kernel=gaussian_psf(1.5, radius=5),
+        psf_mode="discrete_cluster",
+    )
+    rng = np.random.default_rng(123)
+    # Frame height=3, width=4 is smaller than kernel radius ry=rx=5
+    lam = np.full((4, 3, 4), 10.0, dtype=np.float64)
+    out = _sample_cascade_and_psf(lam, det, rng)
+    assert out.shape == (4, 3, 4)
+    assert np.all(out >= 0.0)
+    # With gain=1, cascade_factor=1, every Poisson primary event deposits 1 count conserved inside frame
+    rng_ref = np.random.default_rng(123)
+    expected_total = float(np.sum(rng_ref.poisson(lam)))
+    assert np.isclose(float(np.sum(out)), expected_total, atol=1e-12)

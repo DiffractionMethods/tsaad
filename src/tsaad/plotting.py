@@ -21,20 +21,22 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.ndimage import label, median_filter
 
-from detector_stats.covariance import CovarianceResult
-from detector_stats.masking import MaskingResult
-from detector_stats.pipeline import DetectorStatsReport
-from detector_stats.separation import SeparationResult
-from detector_stats.simulator import DetectorConfig
-from detector_stats.trend import TrendResult
+from tsaad._utils import make_lag_disk_mask
+from tsaad.covariance import CovarianceResult
+from tsaad.masking import MaskingResult
+from tsaad.pipeline import DetectorStatsReport
+from tsaad.separation import SeparationResult
+from tsaad.trend import TrendResult
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
+    from tsaad.simulator import DetectorConfig
+
 
 def _get_pyplot():
-    """Import matplotlib.pyplot lazily so core detector_stats only requires numpy/scipy."""
+    """Import matplotlib.pyplot lazily so core tsaad only requires numpy/scipy."""
     import matplotlib.pyplot as plt
 
     return plt
@@ -42,13 +44,8 @@ def _get_pyplot():
 
 def _disk_summed_covariance(cov: CovarianceResult, radius: int) -> np.ndarray:
     """Compute disk-summed covariance V(mu_b; R) across intensity bins for radius R."""
-    k_size = cov.bin_covariances.shape[1]
-    L = k_size // 2
-    r = int(np.clip(radius, 0, L))
-    yy, xx = np.mgrid[-L : L + 1, -L : L + 1]
-    r_inf = np.maximum(np.abs(yy), np.abs(xx))
-    r_euc = np.hypot(yy, xx)
-    mask = (r_inf <= r) & (r_euc <= r + 0.45)
+    L = cov.bin_covariances.shape[1] // 2
+    mask = make_lag_disk_mask(L, radius)
     n_px = int(np.count_nonzero(mask))
     return (
         np.sum(cov.bin_covariances[:, mask], axis=1)
@@ -61,14 +58,13 @@ def _split_static_bad_mask(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Split static_bad_mask into (large_region_mask, isolated_pixel_mask) for visualization."""
     labeled, n_comp = label(static_bad_mask)
-    large_mask = np.zeros_like(static_bad_mask, dtype=bool)
-    isolated_mask = np.zeros_like(static_bad_mask, dtype=bool)
-    for idx in range(1, n_comp + 1):
-        comp = labeled == idx
-        if np.count_nonzero(comp) > max_isolated_area:
-            large_mask |= comp
-        else:
-            isolated_mask |= comp
+    if n_comp == 0:
+        empty = np.zeros_like(static_bad_mask, dtype=bool)
+        return empty, empty.copy()
+    counts = np.bincount(labeled.ravel())
+    counts[0] = 0
+    large_mask = counts[labeled] > max_isolated_area
+    isolated_mask = static_bad_mask & (~large_mask)
     return large_mask, isolated_mask
 
 
@@ -238,15 +234,12 @@ def plot_radial_convergence(
         cov_true_unit = true_detector.theoretical_covariance_kernel(1.0).copy()
         lt = cov_true_unit.shape[0] // 2
         cov_true_unit[lt, lt] -= true_detector.pixel_factor
-        yy, xx = np.mgrid[-lt : lt + 1, -lt : lt + 1]
-        r_inf_t = np.maximum(np.abs(yy), np.abs(xx))
-        r_euc_t = np.hypot(yy, xx)
         true_cum = []
         for r in radii:
             if r >= lt:
                 true_cum.append(true_detector.g_gamma)
             else:
-                m = (r_inf_t <= r) & (r_euc_t <= r + 0.45)
+                m = make_lag_disk_mask(lt, int(r))
                 true_cum.append(float(np.sum(cov_true_unit[m])))
         ax.plot(
             radii,
@@ -261,7 +254,10 @@ def plot_radial_convergence(
 
     ax.set_xticks(radii)
     ax.set_xlabel(r"Integration lag radius $R$ (pixels)", fontsize=9.5)
-    ax.set_ylabel(r"Cumulative slope $\hat{S}(R) = \sum_{\|\mathbf{u}\|\leq R} \hat{g}(\mathbf{u})$", fontsize=9.5)
+    ax.set_ylabel(
+        r"Cumulative slope $\hat{S}(R) = \sum_{\|\mathbf{u}\|\leq R} \hat{g}(\mathbf{u})$",
+        fontsize=9.5,
+    )
     ax.set_title("Spatial Lag Convergence Profile", fontsize=10.5, fontweight="bold")
     ax.grid(True, linestyle=":", alpha=0.5)
     ax.legend(fontsize=7.6, loc="lower right", framealpha=0.9)
@@ -683,13 +679,19 @@ def plot_separation_or_residuals(
         return ax
 
     ped_offset = float(getattr(cov, "estimated_pedestal_offset", 0.0))
+    scale_unit = max(
+        float(cov.apparent_single_pixel_gain),
+        float(np.sqrt(max(cov.psi, 0.0))),
+        1e-12,
+    )
     mu_shifted_all = trend.expected_intensity + ped_offset
-    valid = trend.valid_mask & (mu_shifted_all >= 1.0)
+    valid = trend.valid_mask & (mu_shifted_all >= 0.5 * scale_unit)
     if not np.any(valid):
         valid = trend.valid_mask
     res = trend.residuals[valid]
-    mu = np.maximum(mu_shifted_all[valid], 1e-3)
-    sigma_px = np.sqrt(np.maximum(cov.apparent_single_pixel_gain * mu + cov.psi, 1e-3))
+    mu = np.maximum(mu_shifted_all[valid], 1e-6 * scale_unit)
+    var_floor = (1e-3 * scale_unit) ** 2
+    sigma_px = np.sqrt(np.maximum(cov.apparent_single_pixel_gain * mu + cov.psi, var_floor))
     z = res / sigma_px
     z_clip = z[(z >= -5.0) & (z <= 5.0)]
 
@@ -785,7 +787,8 @@ def plot_detector_stats_report(
         f"Estimated: G·γ = {report.g_gamma:.3f} ± {report.covariance.g_gamma_se:.3f}  |  "
         f"G = {report.gain:.3f}  |  γ = {report.cascade_factor:.3f} ({sep.separation_method})  |  "
         f"ψ = {report.psi:.2f} ± {report.covariance.psi_se:.2f} ADU²  |  "
-        f"g(0) = {report.covariance.apparent_single_pixel_gain:.3f} (S₂ = {report.s2_factor:.3f}, r_PSF = {report.psf_radius} px)"
+        f"g(0) = {report.covariance.apparent_single_pixel_gain:.3f} "
+        f"(S₂ = {report.s2_factor:.3f}, r_PSF = {report.psf_radius} px)"
     )
     if true_detector is not None:
         true_s0 = true_detector.apparent_single_pixel_gain / max(true_detector.g_gamma, 1e-12)
