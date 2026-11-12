@@ -464,3 +464,29 @@ def test_custom_trend_estimator_and_config_dataclasses() -> None:
     rep2 = estimate_detector_statistics(sim.images, pedestal=0.0, trend_method=_CustomWrapperTrend())
     assert rep2.trend.method_name == "custom_wrapper"
     assert abs(rep2.g_gamma - 1.0) < 0.04
+
+
+def test_sparse_pad_with_blanked_initial_frames() -> None:
+    """Sparse 3DED PAD scan (<20% nonzero) with shutter-blanked/grid-bar-eclipsed early frames."""
+    det = DetectorConfig.ed_pad_timepix(gain=2.6, cascade_factor=1.15)
+    scene = SceneConfig(
+        n_frames=60,
+        height=96,
+        width=96,
+        bg_min_quanta=0.04,
+        bg_max_quanta=0.22,
+        n_bragg_spots=15,
+        n_zingers=2,
+        n_hot_pixels=0,
+        n_dead_pixels=0,
+        shadow_margin_px=0,
+    )
+    sim = simulate_rotation_scan(det, scene, seed=909)
+    imgs = sim.images.copy()
+    # Eclipse the first 28 frames (simulating TEM grid bar occlusion at high starting tilt)
+    rng = np.random.default_rng(910)
+    imgs[:28] = rng.binomial(1, 0.002, size=imgs[:28].shape).astype(np.float64)
+
+    rep = estimate_detector_statistics(imgs, pedestal=0.0)
+    assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.18)
+    assert rep.psi < 0.25

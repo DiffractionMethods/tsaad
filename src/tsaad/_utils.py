@@ -92,7 +92,11 @@ def estimate_quantum_scale_adu(
     fallback = float(np.sqrt(max(float(np.median(diff_var)), 0.0)))
     if fallback > 0.0:
         return fallback
-    return max(float(np.percentile(np.abs(y_sub), 75.0)), 1e-12)
+    abs_y = np.abs(y_sub)
+    pos_vals = abs_y[abs_y > 0.0]
+    if pos_vals.size > 0:
+        return max(float(np.percentile(pos_vals, 25.0)), 1e-12)
+    return 1e-12
 
 
 def is_effectively_integer_adu(

@@ -109,30 +109,67 @@ def load_imageset(source: object):
                 raise ValueError(f"No imagesets found in {source!r}.")
             return imagesets[0]
         if p.is_dir():
+            best_ims = None
             try:
                 expts = ExperimentListFactory.from_filenames([str(p)])
                 imagesets = expts.imagesets()
+                if len(imagesets) == 1:
+                    return imagesets[0]
                 if imagesets:
-                    return sorted(imagesets, key=lambda ims: len(ims), reverse=True)[0]
+                    best_ims = sorted(imagesets, key=lambda ims: len(ims), reverse=True)[0]
             except ValueError as exc:
                 if "Could not determine filename template" not in str(exc):
                     raise
+            _non_image_exts = {
+                ".expt",
+                ".json",
+                ".refl",
+                ".log",
+                ".txt",
+                ".xml",
+                ".ini",
+                ".par",
+                ".run",
+                ".phil",
+                ".sh",
+                ".py",
+                ".md",
+                ".csv",
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".pdf",
+            }
+            candidates = [
+                f
+                for f in p.iterdir()
+                if f.is_file()
+                and not f.name.startswith(".")
+                and f.suffix.lower() not in _non_image_exts
+            ]
+            if candidates:
+                # Keep the dominant file extension if sidecar files with another suffix exist
+                ext_counts: dict[str, int] = {}
+                for f in candidates:
+                    ext = f.suffix.lower()
+                    ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                dom_ext = max(ext_counts, key=lambda k: ext_counts[k])
+                candidates = [f for f in candidates if f.suffix.lower() == dom_ext]
             dir_files = sorted(
-                (
-                    f
-                    for f in p.iterdir()
-                    if f.is_file()
-                    and not f.name.startswith(".")
-                    and f.suffix.lower() not in {".expt", ".json", ".refl", ".log", ".txt"}
-                ),
+                candidates,
                 key=lambda f: [
                     int(tok) if tok.isdigit() else tok.lower()
                     for tok in re.split(r"(\d+)", f.name)
                 ],
             )
             if not dir_files:
+                if best_ims is not None:
+                    return best_ims
                 raise ValueError(f"No image files found in directory {source!r}.")
-            return load_imageset(dir_files)
+            nat_ims = load_imageset(dir_files)
+            if best_ims is not None and len(best_ims) >= len(nat_ims):
+                return best_ims
+            return nat_ims
 
         expts = ExperimentListFactory.from_filenames([str(p)])
         imagesets = expts.imagesets()
@@ -193,7 +230,7 @@ def load_imageset(source: object):
                 fallback_ims = ImageSetFactory.make_imageset(paths)
                 if len(fallback_ims) > len(best):
                     best = fallback_ims
-            except (OSError, RuntimeError, ValueError) as exc:
+            except (AttributeError, OSError, RuntimeError, ValueError) as exc:
                 logger.debug("ImageSetFactory fallback failed: %s", exc)
 
         if link_dir is not None:
@@ -569,14 +606,17 @@ def extract_dxtbx_tile(
         beam_yx = None
 
     n_total = len(imageset)
+    stride = max(1, int(frame_stride))
     if frame_range is not None:
         f_start = max(0, int(frame_range[0]))
         f_stop = min(n_total, int(frame_range[1]))
     else:
-        f_start = 0
-        f_stop = min(n_total, f_start + max(1, int(max_frames)) * max(1, int(frame_stride)))
+        # Center the contiguous window around mid-scan when n_total > max_frames * stride,
+        # avoiding high-tilt TEM grid-bar eclipses in 3DED and frame-0 shutter lag.
+        span = min(n_total, max(1, int(max_frames)) * stride)
+        f_start = max(0, (n_total - span) // 2)
+        f_stop = f_start + span
 
-    stride = max(1, int(frame_stride))
     indices = np.arange(f_start, f_stop, stride, dtype=np.int64)[: max(1, int(max_frames))]
     if indices.size < 4:
         raise ValueError(
@@ -588,15 +628,19 @@ def extract_dxtbx_tile(
     min_trusted, max_trusted = float(trusted[0]), float(trusted[1])
     nominal_pedestal = float(panel.get_pedestal())
 
-    # Query static geometry mask once outside the frame loop (avoiding full-panel C++ double copies
-    # and preventing per-frame saturated Bragg peaks from polluting the static bad mask).
+    has_dyn_mask = (
+        bool(imageset.has_dynamic_mask()) if hasattr(imageset, "has_dynamic_mask") else False
+    )
+
+    # Query static geometry/pixel mask once outside the frame loop (avoiding full-panel C++
+    # copies on every frame while preventing single-frame overloads from polluting static mask).
     static_panel_untrusted: np.ndarray | None = None
     if hasattr(imageset, "get_static_mask"):
         try:
             sm_tuple = imageset.get_static_mask()
             if sm_tuple is not None and len(sm_tuple) > panel_id:
                 static_panel_untrusted = ~sm_tuple[panel_id].as_numpy_array()
-        except (AttributeError, RuntimeError, ValueError) as exc:
+        except (AttributeError, RuntimeError, ValueError, TypeError) as exc:
             logger.debug("get_static_mask() failed: %s", exc)
 
     fmt_class = imageset.get_format_class()
@@ -615,6 +659,16 @@ def extract_dxtbx_tile(
         if (bruker_pedestal is not None and nominal_pedestal == 0.0)
         else nominal_pedestal
     )
+
+    if static_panel_untrusted is None and not has_dyn_mask and hasattr(imageset, "get_mask"):
+        try:
+            m0_tuple = imageset.get_mask(int(indices[0]))
+            if m0_tuple is not None and len(m0_tuple) > panel_id:
+                m0_untrusted = ~m0_tuple[panel_id].as_numpy_array()
+                # Exclude pixels that only failed get_mask(0) due to single-frame overload
+                static_panel_untrusted = m0_untrusted & (~(panel0_raw > max_trusted))
+        except (AttributeError, RuntimeError, ValueError, TypeError) as exc:
+            logger.debug("get_mask(0) static extraction failed: %s", exc)
 
     if bbox_yx is None:
         if auto_select_roi:
@@ -652,9 +706,6 @@ def extract_dxtbx_tile(
         untrusted_mask |= static_panel_untrusted[y0:y1, x0:x1]
         del static_panel_untrusted
 
-    has_dyn_mask = (
-        bool(imageset.has_dynamic_mask()) if hasattr(imageset, "has_dynamic_mask") else False
-    )
     dynamic_untrusted = np.zeros((indices.size, th, tw), dtype=bool)
     if has_dyn_mask:
         try:

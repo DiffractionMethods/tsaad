@@ -87,16 +87,35 @@ def estimate_rough_frame_flux(
     if not np.any(valid_2d):
         return flux
 
+    # Choose one consistent rank-trimming window across all frames of the stack:
+    # - Standard scans (>=40% positive background pixels on upper-quartile frames): 10%..80%
+    #   rank trim, immune to up to 20% Bragg-spot pixel coverage.
+    # - Sparse photon-counting scans (<40% positive pixels, where the 80th percentile can hit 0):
+    #   0%..95% rank trim across all frames so there is no quantization cliff at 20% occupancy.
+    pos_fracs = np.mean((y_sub > 0.0) & valid_2d[None, :, :], axis=(1, 2)) / max(
+        float(np.mean(valid_2d)), 1e-12
+    )
+    use_sparse_trim = float(np.percentile(pos_fracs, 75.0)) < 0.40
+    lo_frac, hi_frac = (0.0, 0.95) if use_sparse_trim else (0.10, 0.80)
+
     for t_idx in range(n_frames):
         if dynamic_bad_mask is not None:
             frame_valid = valid_2d & (~dynamic_bad_mask[t_idx])
             vals = y_sub[t_idx, frame_valid] if np.any(frame_valid) else y_sub[t_idx, valid_2d]
         else:
             vals = y_sub[t_idx, valid_2d]
-        # Use interquartile / 10-80% trimmed mean to ignore Bragg reflections and zingers
-        q10, q80 = np.percentile(vals, [10.0, 80.0])
-        in_range = vals[(vals >= q10) & (vals <= q80)]
-        flux[t_idx] = float(np.mean(in_range)) if in_range.size > 0 else float(np.mean(vals))
+        n_v = vals.size
+        if n_v >= 20:
+            lo = int(lo_frac * n_v)
+            hi = max(lo + 1, int(hi_frac * n_v))
+            if lo == 0:
+                part = np.partition(vals, hi - 1)
+                flux[t_idx] = float(np.mean(part[:hi]))
+            else:
+                part = np.partition(vals, (lo, hi - 1))
+                flux[t_idx] = float(np.mean(part[lo:hi]))
+        else:
+            flux[t_idx] = float(np.mean(vals))
 
     ref_flux = max(float(np.mean(np.abs(flux))), 1e-30)
     flux = np.clip(flux / ref_flux, 1e-6, None)
@@ -459,6 +478,16 @@ def detect_transient_outliers(
     rough_flux = estimate_rough_frame_flux(
         y_sub, static_bad_mask=static_bad_mask, dynamic_bad_mask=dyn_invalid
     )
+    # Detect shutter-closed / beam-blanked / totally eclipsed frames (< 5% of upper-quartile
+    # illuminated flux) so dark frames do not get amplified by 1/rough_flux or corrupt medians.
+    q75_flux = float(np.percentile(rough_flux, 75.0))
+    if q75_flux > 0.0:
+        blanked_frames = rough_flux < (0.05 * q75_flux)
+        if np.any(blanked_frames) and int(np.count_nonzero(~blanked_frames)) >= 4:
+            blanked_3d = blanked_frames[:, None, None] & (~static_bad_mask[None, :, :])
+            dyn_invalid = blanked_3d if dyn_invalid is None else (dyn_invalid | blanked_3d)
+            rough_flux = np.where(blanked_frames, q75_flux, rough_flux)
+            rough_flux /= float(np.mean(rough_flux))
     y_norm = y_sub / rough_flux[:, None, None]
 
     # Replace isolated non-finite/dynamic-masked voxels in y_norm with finite per-pixel median

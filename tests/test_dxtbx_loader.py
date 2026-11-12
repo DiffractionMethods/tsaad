@@ -468,3 +468,36 @@ def test_estimate_from_dxtbx_bruker_format100_scan_with_parenthesized_dir(tmp_pa
     assert bool(rep.masking.static_bad_mask[12, 14]) is True
     assert np.isclose(rep.g_gamma, det_cfg.g_gamma, rtol=0.15)
     assert np.isclose(rep.psi, det_cfg.pixel_factor, atol=2.5)
+
+
+def test_unpadded_directory_filenames_and_get_mask_static_extraction(tmp_path: Path) -> None:
+    """Unpadded directory filenames (1..12) unify into one sweep and get_mask(0) propagates."""
+    pytest.importorskip("dxtbx")
+
+    rng = np.random.default_rng(123)
+    scan_dir = tmp_path / "unpadded_scan"
+    scan_dir.mkdir()
+    for t in range(12):
+        arr = rng.poisson(20.0, size=(32, 32)).astype(np.uint32) + 64
+        _write_bruker_format100_sfrm(
+            scan_dir / f"exp_705_1_{t + 1}.sfrm",
+            arr,
+            baseline=64,
+            subtract_baseline=False,
+            osc_start=0.5 * t,
+            osc_inc=0.5,
+        )
+
+    from dxtbx.format.image import ImageBool
+    from scitbx.array_family import flex
+
+    iset = load_imageset(scan_dir)
+    assert len(iset) == 12
+    # Attach an external lookup mask (e.g. ASIC chip border / pixel_mask) exposed via get_mask(0)
+    valid_bool = np.ones((32, 32), dtype=bool)
+    valid_bool[8:14, 8:12] = False
+    iset.external_lookup.mask.data = ImageBool(flex.bool(valid_bool))
+    tile = extract_dxtbx_tile(iset, tile_size=None, max_frames=12, compute_dials_gain=False)
+    assert tile.images.shape == (12, 32, 32)
+    assert np.all(tile.static_untrusted_mask[8:14, 8:12])
+    assert not np.any(tile.static_untrusted_mask[0:6, 0:6])

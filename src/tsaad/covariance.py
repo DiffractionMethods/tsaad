@@ -291,12 +291,26 @@ def _estimate_residual_quantum_scale(
 ) -> float:
     """Estimate scale-covariant single-pixel quantum ADU unit `q_scale` (scales as c^1)."""
     pos_exp = valid & (expected > 0.0)
-    if np.count_nonzero(pos_exp) >= 16:
-        med_r2 = float(np.median(residuals[pos_exp] ** 2))
-        med_mu = float(np.median(expected[pos_exp]))
-        return max(med_r2 / max(med_mu, 1e-12), 1e-12) if med_r2 > 0.0 else 1.0
+    n_pos = int(np.count_nonzero(pos_exp))
+    if n_pos >= 16:
+        r2_vals = residuals[pos_exp] ** 2
+        mu_vals = expected[pos_exp]
+        med_r2 = float(np.median(r2_vals))
+        med_mu = float(np.median(mu_vals))
+        q_med = med_r2 / max(med_mu, 1e-12) if med_r2 > 0.0 else 0.0
+        hi = max(1, int(0.99 * n_pos))
+        keep_idx = np.argpartition(r2_vals, hi - 1)[:hi]
+        trim_r2 = float(np.mean(r2_vals[keep_idx]))
+        trim_mu = float(np.mean(mu_vals[keep_idx]))
+        q_trim = trim_r2 / max(trim_mu, 1e-12) if trim_r2 > 0.0 else 0.0
+        q_est = max(q_med, q_trim)
+        if q_est > 0.0:
+            return max(q_est, 1e-12)
     if np.any(valid):
-        return max(float(np.median(np.abs(residuals[valid]))), 1e-12)
+        abs_r = np.abs(residuals[valid])
+        pos_r = abs_r[abs_r > 0.0]
+        if pos_r.size > 0:
+            return max(float(np.median(pos_r)), 1e-12)
     return 1.0
 
 
