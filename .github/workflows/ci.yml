@@ -80,7 +80,7 @@ jobs:
             pytest
             pytest-xdist
             pip
-            "setuptools>=77"
+            setuptools>=77
           cache-downloads: true
       - name: Install tsaad (editable, using conda dependencies)
         run: pip install --no-deps --no-build-isolation -e .

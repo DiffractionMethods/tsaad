@@ -282,7 +282,7 @@ def plot_psf_autocorrelation_kernel(
         disp_L = min(L, max(1, int(max_display_lag)))
 
     sub = alpha[L - disp_L : L + disp_L + 1, L - disp_L : L + disp_L + 1]
-    extent = [-disp_L - 0.5, disp_L + 0.5, -disp_L - 0.5, disp_L + 0.5]
+    extent = (-disp_L - 0.5, disp_L + 0.5, -disp_L - 0.5, disp_L + 0.5)
 
     im = ax.imshow(
         sub,
