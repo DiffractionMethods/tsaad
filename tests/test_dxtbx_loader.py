@@ -336,13 +336,38 @@ def _write_bruker_format100_sfrm(
     path.write_bytes(bytes(payload))
 
 
+def test_legacy_bruker_format100_reader_unit(tmp_path: Path) -> None:
+    """Verify legacy Bruker FORMAT 100 reader on both uncompressed .sfrm and .sfrm.bz2."""
+    pytest.importorskip("dxtbx")
+
+    expected = np.full((32, 40), 75, dtype=np.uint32)
+    expected[0, 0] = 0
+    expected[0, 1] = 19
+    expected[0, 2] = 64
+    expected[1, 0] = 65
+    expected[2, 3] = 512
+    expected[4, 5] = 92_000
+
+    p_p2 = tmp_path / "photon2_0001.sfrm"
+    _write_bruker_format100_sfrm(p_p2, expected, baseline=64, subtract_baseline=True)
+    p_bz2 = tmp_path / "photon2_0001.sfrm.bz2"
+    p_bz2.write_bytes(bz2.compress(p_p2.read_bytes()))
+
+    for p_chk in (p_p2, p_bz2):
+        leg = _read_bruker_format100_panel(str(p_chk))
+        assert leg is not None
+        assert np.array_equal(leg[0], expected.astype(np.float64))
+        assert np.isclose(leg[1], 64.0)
+
+
 def test_format_bruker_modern_905_fixes_unit(tmp_path: Path) -> None:
-    """Verify all four FormatBrukerModern fixes (#905) and legacy reader equivalence."""
+    """Verify all four upstream FormatBrukerModern fixes (dxtbx #906)."""
     pytest.importorskip("dxtbx")
     from dxtbx.format.FormatBrukerModern import FormatBrukerModern
     from dxtbx.model.beam import Probe
 
-    assert _needs_legacy_bruker_format100_workaround(FormatBrukerModern) is False
+    if _needs_legacy_bruker_format100_workaround(FormatBrukerModern):
+        pytest.skip("Upstream FormatBrukerModern fixes (#906) require dxtbx >= 3.32")
 
     # 1. Photon II X-ray with baseline=64, underflows (0, 19, 64), 2b overflow (512), 4b (92000)
     expected = np.full((32, 40), 75, dtype=np.uint32)
@@ -365,15 +390,6 @@ def test_format_bruker_modern_905_fixes_unit(tmp_path: Path) -> None:
     assert np.isclose(panel_p2.get_thickness(), 0.0)
     assert np.isclose(panel_p2.get_mu(), 0.0)
     assert iset_p2.get_beam(0).get_probe() == Probe.xray
-
-    # Legacy fallback reader matches FormatBrukerModern pixel-for-pixel on both .sfrm and .sfrm.bz2
-    p_bz2 = tmp_path / "photon2_0001.sfrm.bz2"
-    p_bz2.write_bytes(bz2.compress(p_p2.read_bytes()))
-    for p_chk in (p_p2, p_bz2):
-        leg = _read_bruker_format100_panel(str(p_chk))
-        assert leg is not None
-        assert np.array_equal(leg[0], expected.astype(np.float64))
-        assert np.isclose(leg[1], 64.0)
 
     # 2. Photon IV X-ray: DETTYPE starting with CMOS-PHOTONIV must take the Photon branch (not ED-1)
     p_p4 = tmp_path / "photon4_0001.sfrm"

@@ -7,8 +7,8 @@ the smooth background time series without biasing single-pixel or lagged covaria
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import warnings
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.ndimage import (

@@ -113,7 +113,7 @@ def test_masking_static_and_transient_anomalies() -> None:
     interior_spots = sim.spot_mask & (~true_bad[None, :, :])
     recall_spots = float(
         np.count_nonzero(mask_res.transient_outlier_mask & interior_spots)
-    ) / float(max(1, np.count_nonzero(interior_spots)))
+    ) / float(max(1, int(np.count_nonzero(interior_spots))))
     assert recall_spots > 0.80
     valid_bg_frac = float(
         np.count_nonzero(mask_res.valid_mask[:, ~true_bad])

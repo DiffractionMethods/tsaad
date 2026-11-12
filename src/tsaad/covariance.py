@@ -7,8 +7,8 @@ by summing empirical spatial cross-covariances across intensity bins.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import warnings
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.ndimage import binary_dilation, gaussian_filter, median_filter

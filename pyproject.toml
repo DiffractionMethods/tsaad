@@ -12,6 +12,28 @@ license-files = ["LICENSE"]
 authors = [
     { name = "David Waterman", email = "dgwaterman@gmail.com" },
 ]
+keywords = [
+    "crystallography",
+    "diffraction",
+    "detector",
+    "gain",
+    "point-spread-function",
+    "time-series",
+    "x-ray",
+    "electron-diffraction",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Typing :: Typed",
+]
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
@@ -19,7 +41,9 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/dagewa/tsaad"
+Homepage = "https://github.com/DiffractionMethods/tsaad"
+Repository = "https://github.com/DiffractionMethods/tsaad"
+Issues = "https://github.com/DiffractionMethods/tsaad/issues"
 
 [project.optional-dependencies]
 plot = ["matplotlib"]

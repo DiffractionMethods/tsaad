@@ -10,16 +10,16 @@ implemented in pure NumPy.
 from __future__ import annotations
 
 import atexit
-from dataclasses import dataclass
 import inspect
 import logging
 import os
-from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Sequence
 import weakref
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -398,7 +398,7 @@ def _read_bruker_format100_panel(image_path: str) -> tuple[np.ndarray, float] | 
     unsigned integer types (`<u1`, `<u2`, `<u4`), and header/table bounds validation.
     Returns `(image_2d, baseline_pedestal)` or `None` if not a Bruker FORMAT 100 file.
     """
-    dtype_by_bytes = {1: np.dtype("<u1"), 2: np.dtype("<u2"), 4: np.dtype("<u4")}
+    dtype_by_bytes: dict[int, str] = {1: "<u1", 2: "<u2", 4: "<u4"}
     try:
         from dxtbx.format.FormatBruker import FormatBruker
 
@@ -711,6 +711,18 @@ def extract_dxtbx_tile(
         if (bruker_pedestal is not None and nominal_pedestal == 0.0)
         else nominal_pedestal
     )
+    # Legacy FormatBrukerModern (< dxtbx #906) hardcoded Pilatus-copied "Si" / 0.45 mm on all
+    # Bruker detectors; ignore those bogus sensor attributes when the legacy fallback is active.
+    sensor_material = (
+        ""
+        if use_legacy_bruker
+        else (str(panel.get_material()) if hasattr(panel, "get_material") else "")
+    )
+    sensor_thickness_mm = (
+        0.0
+        if use_legacy_bruker
+        else (float(panel.get_thickness()) if hasattr(panel, "get_thickness") else 0.0)
+    )
     return DxtbxTileData(
         images=images,
         static_untrusted_mask=untrusted_mask,
@@ -723,10 +735,8 @@ def extract_dxtbx_tile(
         bbox_yx=(y0, y1, x0, x1),
         panel_shape_yx=(panel_height, panel_width),
         dials_dispersion_gains=dials_gains,
-        sensor_material=str(panel.get_material()) if hasattr(panel, "get_material") else "",
-        sensor_thickness_mm=(
-            float(panel.get_thickness()) if hasattr(panel, "get_thickness") else 0.0
-        ),
+        sensor_material=sensor_material,
+        sensor_thickness_mm=sensor_thickness_mm,
         pixel_size_mm=(float(px_size[0]), float(px_size[1])),
         dynamic_untrusted_mask=dynamic_untrusted,
     )
