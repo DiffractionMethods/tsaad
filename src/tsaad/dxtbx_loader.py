@@ -19,7 +19,7 @@ import tempfile
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -49,6 +49,8 @@ class DxtbxTileData:
     sensor_thickness_mm: float = 0.0  # sensor thickness in mm from dxtbx Panel
     pixel_size_mm: tuple[float, float] = (0.0, 0.0)  # (px_x, px_y) in mm from dxtbx Panel
     dynamic_untrusted_mask: np.ndarray | None = None  # (T, H, W) bool: per-frame overloads/masks
+    format_class: str = ""  # dxtbx Format class name (e.g. 'FormatCBFMiniPilatus')
+    total_frames: int = 0  # total frames in full sweep before sub-window slicing
 
     @property
     def dials_dispersion_gain_mean(self) -> float | None:
@@ -61,6 +63,164 @@ class DxtbxTileData:
         if self.dials_dispersion_gains is None or self.dials_dispersion_gains.size <= 1:
             return 0.0 if self.dials_dispersion_gains is not None else None
         return float(np.std(self.dials_dispersion_gains, ddof=1))
+
+
+_NON_IMAGE_EXTS: frozenset[str] = frozenset(
+    {
+        ".expt",
+        ".json",
+        ".refl",
+        ".log",
+        ".txt",
+        ".xml",
+        ".ini",
+        ".par",
+        ".par3d",
+        ".run",
+        ".phil",
+        ".sh",
+        ".csh",
+        ".com",
+        ".py",
+        ".md",
+        ".csv",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".pdf",
+        ".html",
+        ".js",
+        ".lp",
+        ".inp",
+        ".xds",
+        ".hkl",
+        ".mtz",
+        ".sca",
+        ".cif",
+        ".mmcif",
+        ".pdb",
+        ".dat",
+        ".out",
+        ".in",
+        ".mat",
+        ".bpm",
+        ".gen",
+        ".sum",
+        ".p4p",
+        ".x",
+        ".gnu",
+        ".pickle",
+        ".npy",
+    }
+)
+
+_XDS_TABLE_CBF_RE = re.compile(
+    r"^(bkginit|blank|gain|abs|absorp|decay|modpix|bkgpix|"
+    r"d?x-corrections|d?y-corrections|frame)(_\d+)?\.cbf$",
+    re.IGNORECASE,
+)
+
+_SKIP_SUBDIR_NAMES: frozenset[str] = frozenset(
+    {
+        "other",
+        "proc",
+        "process",
+        "processing",
+        "xds",
+        "xia2",
+        "dials",
+        "autoproc",
+        "fast_dp",
+        "hkl2000",
+        "mosflm",
+        "dimple",
+        "ccp4",
+        "logfiles",
+    }
+)
+
+_PREFERRED_DATA_SUBDIRS: frozenset[str] = frozenset(
+    {"data", "frames", "images", "series", "raw"}
+)
+
+
+def _list_candidate_image_files(directory: Path) -> list[Path]:
+    """Return candidate diffraction image/master files directly inside `directory`."""
+    candidates = [
+        f
+        for f in directory.iterdir()
+        if f.is_file()
+        and not f.name.startswith(".")
+        and f.suffix.lower() not in _NON_IMAGE_EXTS
+        and not _XDS_TABLE_CBF_RE.match(f.name)
+    ]
+    if not candidates:
+        return []
+
+    nxs_files = [f for f in candidates if f.suffix.lower() == ".nxs"]
+    if nxs_files:
+        return nxs_files
+
+    master_h5 = [f for f in candidates if f.name.lower().endswith("_master.h5")]
+    if master_h5:
+        return master_h5
+
+    # Group numeric frame extensions (.001 .. .360) under one bucket so they are never split
+    ext_counts: dict[str, int] = {}
+    for f in candidates:
+        ext = f.suffix.lower()
+        key = "<numeric>" if re.fullmatch(r"\.\d+", ext) else ext
+        ext_counts[key] = ext_counts.get(key, 0) + 1
+    dom_key = max(ext_counts, key=lambda k: ext_counts[k])
+    return [
+        f
+        for f in candidates
+        if ("<numeric>" if re.fullmatch(r"\.\d+", f.suffix.lower()) else f.suffix.lower())
+        == dom_key
+    ]
+
+
+def _resolve_image_directory(root_dir: Path, max_depth: int = 4) -> tuple[Path, list[Path]]:
+    """Locate `root_dir` or its primary raw-data subdirectory via bounded BFS."""
+    direct = _list_candidate_image_files(root_dir)
+    if direct:
+        return root_dir, direct
+
+    frontier = [root_dir]
+    for _ in range(max_depth):
+        next_frontier: list[Path] = []
+        matches: list[tuple[Path, list[Path]]] = []
+        for cur in frontier:
+            try:
+                subdirs = sorted(
+                    d
+                    for d in cur.iterdir()
+                    if d.is_dir()
+                    and not d.name.startswith(".")
+                    and d.name.lower() not in _SKIP_SUBDIR_NAMES
+                )
+            except OSError:
+                continue
+            for sub in subdirs:
+                cands = _list_candidate_image_files(sub)
+                if cands:
+                    matches.append((sub, cands))
+                else:
+                    next_frontier.append(sub)
+        if matches:
+            matches.sort(
+                key=lambda item: (
+                    item[0].name.lower() in _PREFERRED_DATA_SUBDIRS,
+                    len(item[1]),
+                ),
+                reverse=True,
+            )
+            return matches[0]
+        if not next_frontier:
+            break
+        frontier = next_frontier
+
+    return root_dir, []
 
 
 def _register_tempdir_cleanup(owner: object, link_dir: Path) -> None:
@@ -109,52 +269,7 @@ def load_imageset(source: object):
                 raise ValueError(f"No imagesets found in {source!r}.")
             return imagesets[0]
         if p.is_dir():
-            best_ims = None
-            try:
-                expts = ExperimentListFactory.from_filenames([str(p)])
-                imagesets = expts.imagesets()
-                if len(imagesets) == 1:
-                    return imagesets[0]
-                if imagesets:
-                    best_ims = sorted(imagesets, key=lambda ims: len(ims), reverse=True)[0]
-            except ValueError as exc:
-                if "Could not determine filename template" not in str(exc):
-                    raise
-            _non_image_exts = {
-                ".expt",
-                ".json",
-                ".refl",
-                ".log",
-                ".txt",
-                ".xml",
-                ".ini",
-                ".par",
-                ".run",
-                ".phil",
-                ".sh",
-                ".py",
-                ".md",
-                ".csv",
-                ".jpg",
-                ".jpeg",
-                ".png",
-                ".pdf",
-            }
-            candidates = [
-                f
-                for f in p.iterdir()
-                if f.is_file()
-                and not f.name.startswith(".")
-                and f.suffix.lower() not in _non_image_exts
-            ]
-            if candidates:
-                # Keep the dominant file extension if sidecar files with another suffix exist
-                ext_counts: dict[str, int] = {}
-                for f in candidates:
-                    ext = f.suffix.lower()
-                    ext_counts[ext] = ext_counts.get(ext, 0) + 1
-                dom_ext = max(ext_counts, key=lambda k: ext_counts[k])
-                candidates = [f for f in candidates if f.suffix.lower() == dom_ext]
+            target_dir, candidates = _resolve_image_directory(p)
             dir_files = sorted(
                 candidates,
                 key=lambda f: [
@@ -162,14 +277,14 @@ def load_imageset(source: object):
                     for tok in re.split(r"(\d+)", f.name)
                 ],
             )
-            if not dir_files:
-                if best_ims is not None:
-                    return best_ims
+            if dir_files:
+                return load_imageset(dir_files)
+
+            expts = ExperimentListFactory.from_filenames([str(target_dir)])
+            imagesets = expts.imagesets()
+            if not imagesets:
                 raise ValueError(f"No image files found in directory {source!r}.")
-            nat_ims = load_imageset(dir_files)
-            if best_ims is not None and len(best_ims) >= len(nat_ims):
-                return best_ims
-            return nat_ims
+            return sorted(imagesets, key=lambda ims: len(ims), reverse=True)[0]
 
         expts = ExperimentListFactory.from_filenames([str(p)])
         imagesets = expts.imagesets()
@@ -280,6 +395,19 @@ def select_default_roi_bbox(
     return (y0, y0 + th, x0, x0 + tw)
 
 
+def _box_sum_2d(arr: np.ndarray, ky: int, kx: int) -> np.ndarray:
+    """Fast 2D summed-area-table box sum over `[r - ky, r + ky] x [c - kx, c + kx]`."""
+    h, w = arr.shape
+    sat = np.pad(arr, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    rows = np.arange(h)
+    cols = np.arange(w)
+    r0 = np.maximum(0, rows - ky)[:, None]
+    r1 = np.minimum(h, rows + ky + 1)[:, None]
+    c0 = np.maximum(0, cols - kx)[None, :]
+    c1 = np.minimum(w, cols + kx + 1)[None, :]
+    return sat[r1, c1] - sat[r0, c1] - sat[r1, c0] + sat[r0, c0]
+
+
 def _select_best_quadrant_roi_bbox(
     raw_panel0: np.ndarray,
     static_panel_untrusted: np.ndarray | None,
@@ -288,7 +416,7 @@ def _select_best_quadrant_roi_bbox(
     tile_size: tuple[int, int] | None,
     beam_center_yx: tuple[float, float] | None,
 ) -> tuple[int, int, int, int]:
-    """Score up to 4 quadrant candidate ROI boxes on frame 0 to avoid shadowed/dead regions."""
+    """Score multi-radius quadrant candidate ROIs on frame 0 for health and spatial gradient."""
     panel_height, panel_width = raw_panel0.shape
     primary = select_default_roi_bbox(
         panel_height, panel_width, tile_size=tile_size, beam_center_yx=beam_center_yx
@@ -303,18 +431,21 @@ def _select_best_quadrant_roi_bbox(
     else:
         cy, cx = 0.5 * panel_height, 0.5 * panel_width
 
-    clearance_y = max(32.0, 0.06 * panel_height)
-    clearance_x = max(32.0, 0.06 * panel_width)
+    dir_y0 = 1.0 if (panel_height - cy) >= cy else -1.0
+    dir_x0 = 1.0 if (panel_width - cx) >= cx else -1.0
     candidates: list[tuple[int, int, int, int]] = [primary]
-    for dy_sign in (1.0, -1.0):
-        for dx_sign in (1.0, -1.0):
-            t_cy = cy + dy_sign * (clearance_y + 0.5 * th)
-            t_cx = cx + dx_sign * (clearance_x + 0.5 * tw)
-            y0 = int(np.clip(np.rint(t_cy - 0.5 * th), 0, panel_height - th))
-            x0 = int(np.clip(np.rint(t_cx - 0.5 * tw), 0, panel_width - tw))
-            cand = (y0, y0 + th, x0, x0 + tw)
-            if cand not in candidates:
-                candidates.append(cand)
+    for frac in (0.06, 0.16, 0.28):
+        cl_y = max(32.0, frac * panel_height)
+        cl_x = max(32.0, frac * panel_width)
+        for dy_sign in (dir_y0, -dir_y0):
+            for dx_sign in (dir_x0, -dir_x0):
+                t_cy = cy + dy_sign * (cl_y + 0.5 * th)
+                t_cx = cx + dx_sign * (cl_x + 0.5 * tw)
+                y0 = int(np.clip(np.rint(t_cy - 0.5 * th), 0, panel_height - th))
+                x0 = int(np.clip(np.rint(t_cx - 0.5 * tw), 0, panel_width - tw))
+                cand = (y0, y0 + th, x0, x0 + tw)
+                if cand not in candidates:
+                    candidates.append(cand)
 
     min_t, max_t = trusted_range
     best_bbox = primary
@@ -330,30 +461,34 @@ def _select_best_quadrant_roi_bbox(
             continue
         vals = sub[valid] - pedestal
         active_frac = float(np.mean(vals > 0.0))
-        q15, q50, q85 = np.percentile(vals, [15.0, 50.0, 85.0])
-        rel_span = float((q85 - q15) / max(abs(float(q50)), 1.0))
-        span_factor = min(1.0, max(0.15, rel_span / 0.20))
-        # Small preference (+0.05) for primary quadrant when candidates are equally healthy
-        tie_bonus = 0.05 if idx == 0 else 0.0
+        # Evaluate spatial background span on 17x17 block-averaged intensities (after clamping
+        # top-5% Bragg spikes) so Poisson shot noise on a flat solvent-ring plateau is not
+        # mistaken for a genuine macroscopic background gradient.
+        if vals.size >= 64 and active_frac > 0.02:
+            hi_clip = float(np.percentile(vals, 95.0))
+            clipped = np.where(valid, np.minimum(sub - pedestal, hi_clip), 0.0)
+            cnt_box = _box_sum_2d(valid.astype(np.float64), 8, 8)
+            sum_box = _box_sum_2d(clipped, 8, 8)
+            good_box = valid & (cnt_box >= 64.0)
+            smooth_vals = (
+                sum_box[good_box] / cnt_box[good_box]
+                if np.count_nonzero(good_box) >= 32
+                else vals
+            )
+        else:
+            smooth_vals = vals
+        q10, q50, q90 = np.percentile(smooth_vals, [10.0, 50.0, 90.0])
+        denom = max(abs(float(q50)), 0.25 * abs(float(q90)), 1e-6)
+        rel_span = float((q90 - q10) / denom)
+        span_factor = min(1.0, max(0.20, rel_span / 0.45))
+        # Small preference (+0.03) for primary quadrant when candidates are equally healthy
+        tie_bonus = 0.03 if idx == 0 else 0.0
         score = valid_frac * (0.4 + 0.6 * active_frac) * span_factor + tie_bonus
         if score > best_score:
             best_score = score
             best_bbox = (y0, y1, x0, x1)
 
     return best_bbox
-
-
-def _box_sum_2d(arr: np.ndarray, ky: int, kx: int) -> np.ndarray:
-    """Fast 2D summed-area-table box sum over `[r - ky, r + ky] x [c - kx, c + kx]`."""
-    h, w = arr.shape
-    sat = np.pad(arr, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
-    rows = np.arange(h)
-    cols = np.arange(w)
-    r0 = np.maximum(0, rows - ky)[:, None]
-    r1 = np.minimum(h, rows + ky + 1)[:, None]
-    c0 = np.maximum(0, cols - kx)[None, :]
-    c1 = np.minimum(w, cols + kx + 1)[None, :]
-    return sat[r1, c1] - sat[r0, c1] - sat[r1, c0] + sat[r0, c0]
 
 
 def compute_dials_dispersion_gain_on_tile(
@@ -541,6 +676,88 @@ def _read_panel_frame(
     return raw_panel, None
 
 
+def _try_load_per_frame_subwindow(
+    source: object,
+    frame_range: tuple[int, int] | None,
+    max_frames: int,
+    frame_stride: int,
+) -> tuple[Any, int, int] | None:
+    """Fast path for directories with hundreds/thousands of per-frame files.
+
+    Groups candidate filenames into contiguous sweeps in pure Python and opens only the
+    requested sub-window via `dxtbx`, avoiding O(N_files) header reads over NFS.
+    Returns `(sub_imageset, frame_index_offset)` or `None` when not applicable.
+    """
+    if not isinstance(source, (str, Path)):
+        return None
+    p = Path(source)
+    if not p.is_dir():
+        return None
+
+    stride = max(1, int(frame_stride))
+    req_span = max(1, int(max_frames)) * stride
+    _, candidates = _resolve_image_directory(p)
+    if len(candidates) <= max(160, 2 * req_span):
+        return None
+    if candidates[0].suffix.lower() in {".nxs", ".h5", ".hdf5", ".mrc"}:
+        return None
+
+    groups: dict[tuple[str, str, str], list[tuple[int, Path]]] = {}
+    for f in candidates:
+        name_low = f.name.lower()
+        comp_ext = ""
+        for c_ext in (".bz2", ".gz", ".xz"):
+            if name_low.endswith(c_ext):
+                comp_ext = c_ext
+                name_low = name_low[: -len(c_ext)]
+                break
+        base_stem, base_ext = os.path.splitext(name_low)
+        if re.fullmatch(r"\.\d+", base_ext):
+            key = (base_stem, "", "<numeric>" + comp_ext)
+            num = int(base_ext[1:])
+        else:
+            m = re.match(r"^(.*?)(\d+)(\D*)$", base_stem)
+            if not m:
+                continue
+            key = (m.group(1), m.group(3), base_ext + comp_ext)
+            num = int(m.group(2))
+        groups.setdefault(key, []).append((num, f))
+
+    if not groups:
+        return None
+    best_items = max(groups.values(), key=len)
+    best_items.sort(key=lambda item: (item[0], item[1].name))
+    n_sweep = len(best_items)
+    if n_sweep <= max(160, 2 * req_span):
+        return None
+
+    nums = [item[0] for item in best_items]
+    if len(set(nums)) != n_sweep or (nums[-1] - nums[0]) != (n_sweep - 1):
+        return None
+
+    if frame_range is not None:
+        f_start = max(0, int(frame_range[0]))
+        f_stop = min(n_sweep, int(frame_range[1]))
+    else:
+        span = min(n_sweep, req_span)
+        f_start = max(0, (n_sweep - span) // 2)
+        f_stop = f_start + span
+
+    window_files = [item[1] for item in best_items[f_start:f_stop]]
+    if len(window_files) < 4:
+        return None
+
+    try:
+        sub_ims = load_imageset(window_files)
+    except Exception as exc:
+        logger.debug("Sub-window directory fast path fell back to full load: %s", exc)
+        return None
+
+    if len(sub_ims) != len(window_files):
+        return None
+    return sub_ims, f_start, n_sweep
+
+
 def extract_dxtbx_tile(
     source: object,
     panel_id: int = 0,
@@ -584,7 +801,19 @@ def extract_dxtbx_tile(
         Extracted 3D image stack, static and dynamic untrusted masks, panel metadata,
         and single-frame dispersion baseline.
     """
-    imageset = load_imageset(source)
+    sub_win = _try_load_per_frame_subwindow(
+        source=source,
+        frame_range=frame_range,
+        max_frames=max_frames,
+        frame_stride=frame_stride,
+    )
+    if sub_win is not None:
+        imageset, index_offset, total_sweep_frames = sub_win
+    else:
+        imageset = load_imageset(source)
+        index_offset = 0
+        total_sweep_frames = len(imageset)
+
     detector = imageset.get_detector()
     if panel_id < 0 or panel_id >= len(detector):
         raise ValueError(
@@ -607,7 +836,9 @@ def extract_dxtbx_tile(
 
     n_total = len(imageset)
     stride = max(1, int(frame_stride))
-    if frame_range is not None:
+    if sub_win is not None:
+        f_start, f_stop = 0, n_total
+    elif frame_range is not None:
         f_start = max(0, int(frame_range[0]))
         f_stop = min(n_total, int(frame_range[1]))
     else:
@@ -774,10 +1005,13 @@ def extract_dxtbx_tile(
         if use_legacy_bruker
         else (float(panel.get_thickness()) if hasattr(panel, "get_thickness") else 0.0)
     )
+    fmt_name = (
+        fmt_class.__name__ if fmt_class is not None else type(imageset).__name__
+    )
     return DxtbxTileData(
         images=images,
         static_untrusted_mask=untrusted_mask,
-        frame_indices=indices,
+        frame_indices=indices + index_offset,
         panel_id=panel_id,
         panel_name=str(panel.get_name()),
         detector_gain=float(panel.get_gain()),
@@ -790,6 +1024,8 @@ def extract_dxtbx_tile(
         sensor_thickness_mm=sensor_thickness_mm,
         pixel_size_mm=(float(px_size[0]), float(px_size[1])),
         dynamic_untrusted_mask=dynamic_untrusted,
+        format_class=fmt_name,
+        total_frames=int(total_sweep_frames),
     )
 
 

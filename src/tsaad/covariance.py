@@ -567,6 +567,8 @@ def estimate_lagged_covariance(
     fixed_psf_radius: int | None = None,
     auto_calibrate_pedestal: bool = True,
     config: CovarianceConfig | None = None,
+    *,
+    _is_nonneg_integer: bool = False,
 ) -> CovarianceResult:
     """Accumulate lagged spatial cross-covariances across intensity bins and fit (G*gamma, psi).
 
@@ -648,7 +650,26 @@ def estimate_lagged_covariance(
         base_weights = 1.0 / (scale_c0**2)
         base_weights /= float(np.mean(base_weights))
 
-        if psi < 2.0 * psi_se and has_zero_noise_floor:
+        narrow_int_pad = False
+        mean_mu = max(float(np.mean(bin_means)), 1e-300)
+        bin_cv = float(np.std(bin_means)) / mean_mu
+        if _is_nonneg_integer and estimated_pedestal_offset == 0.0 and bin_cv < 0.12:
+            c_card = 0.25 * (
+                bin_cov_use[:, L - 1, L]
+                + bin_cov_use[:, L + 1, L]
+                + bin_cov_use[:, L, L - 1]
+                + bin_cov_use[:, L, L + 1]
+            )
+            yy0, xx0 = np.mgrid[-L : L + 1, -L : L + 1]
+            c_out = np.median(
+                bin_cov_use[:, np.maximum(np.abs(yy0), np.abs(xx0)) == L], axis=1
+            )
+            nn_cov_ratio = float(np.median(c_card - c_out)) / max(
+                float(np.median(c0_bins)), 1e-300
+            )
+            narrow_int_pad = nn_cov_ratio < 0.08
+
+        if (psi < 2.0 * psi_se and has_zero_noise_floor) or narrow_int_pad:
             psi = 0.0
             g0, g0_se, _ = _irls_zero_intercept_fit(
                 bin_means, c0_bins, np.sqrt(2.0) * scale_c0, n_iter=cfg.offdiag_irls_max_iter
@@ -803,13 +824,23 @@ def estimate_lagged_covariance(
             break
 
         r_psf = 0
+        weak_nn_psf = shell_mean_per_px[1] < 0.06 * g0_corr
         for r in range(1, L + 1):
             sig_thresh = max(
                 cfg.psf_shell_se_threshold * shell_ses[r],
                 cfg.psf_shell_rel_cum_threshold * max(cumulative_slopes[r - 1], g0_corr),
             )
             per_px_ok = shell_mean_per_px[r] > cfg.psf_shell_rel_px_threshold * g0_corr
-            if shell_slopes[r] > sig_thresh and per_px_ok:
+            if r >= 2:
+                # Physical detector PSFs must decay radially in per-pixel autocorrelation;
+                # when lag-1 coupling is weak (<6% of g0 per pixel), outer ring sums must
+                # also decay faster than the Cauchy bound rather than growing on diffuse streaks.
+                decay_ok = shell_mean_per_px[r] <= 0.85 * shell_mean_per_px[r - 1]
+                if weak_nn_psf:
+                    decay_ok = decay_ok and (shell_slopes[r] <= 0.45 * shell_slopes[r - 1])
+            else:
+                decay_ok = True
+            if shell_slopes[r] > sig_thresh and per_px_ok and decay_ok:
                 r_psf = r
             else:
                 break

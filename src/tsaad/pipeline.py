@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from tsaad._utils import validate_and_sanitize_stack
+from tsaad._utils import is_effectively_integer_adu, validate_and_sanitize_stack
 from tsaad.covariance import (
     CovarianceConfig,
     CovarianceResult,
@@ -301,12 +301,20 @@ def estimate_detector_statistics(
             pedestal=pedestal,
         )
 
+    is_nonneg_int = False
+    if np.any(mask_res.valid_mask):
+        valid_vals = y_sub[mask_res.valid_mask]
+        is_nonneg_int = bool(
+            float(np.min(valid_vals)) >= -1e-6 and is_effectively_integer_adu(valid_vals)
+        )
+
     cov_res = estimate_lagged_covariance(
         trend_res,
         max_lag=max_lag,
         n_bins=n_bins,
         auto_calibrate_pedestal=auto_calibrate_pedestal,
         config=covariance_config,
+        _is_nonneg_integer=is_nonneg_int,
     )
 
     sep_res = separate_gain_and_cascade(

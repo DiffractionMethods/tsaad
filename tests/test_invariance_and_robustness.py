@@ -490,3 +490,47 @@ def test_sparse_pad_with_blanked_initial_frames() -> None:
     rep = estimate_detector_statistics(imgs, pedestal=0.0)
     assert np.isclose(rep.g_gamma, det.g_gamma, rtol=0.18)
     assert rep.psi < 0.25
+
+
+def test_flat_integer_pad_narrow_range_zero_intercept_guard() -> None:
+    """On a flat-plateau integer photon-counting PAD tile (CV < 0.12) where crowded spot-wing
+    censoring slightly depresses variance in the highest intensity bins, enforcing the physical
+    zero-intercept PAD constraint avoids lever-arm pivoting of (g0, psi).
+    """
+    rng = np.random.default_rng(717)
+    n_t, ny, nx = 48, 80, 80
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    # Narrow flat plateau spanning ~12.4..14.2 ADU (CV ~ 0.04)
+    mu_2d = 12.4 + 1.8 * (yy / float(ny))
+    y = rng.poisson(mu_2d[None, :, :], size=(n_t, ny, nx)).astype(np.float64)
+    # Mild upper-tail censoring on the brightest 20% band (mimicking crowded spot-wing hysteresis)
+    bright_band = mu_2d > 13.8
+    high_tail = bright_band[None, :, :] & (y > 21.0)
+    y[high_tail] = 21.0
+
+    rep = estimate_detector_statistics(y, pedestal=0.0, max_lag=4)
+    assert rep.psi == pytest.approx(0.0, abs=1e-9)
+    assert rep.g_gamma == pytest.approx(1.0, abs=0.07)
+
+
+def test_diffuse_mosaicity_streak_pedestal_does_not_inflate_r_psf() -> None:
+    """Faint long-range diffuse streaks on a photon-counting PAD must not cause r_PSF to
+    march outward across growing ring circumferences (mimicking 5vog / pfplrxdata_9jq9).
+    """
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(818)
+    n_t, ny, nx = 48, 96, 96
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    mu_2d = 35.0 + 95.0 * (1.0 - np.hypot(yy, xx) / np.hypot(ny, nx))
+    lam = np.empty((n_t, ny, nx), dtype=np.float64)
+    for t in range(n_t):
+        # Broad (sigma=4.8 px) faint frame-varying diffuse background (~0.8% per-pixel pedestal)
+        diffuse = gaussian_filter(rng.normal(0.0, 4.2, size=(ny, nx)), sigma=4.8, mode="nearest")
+        lam[t] = np.maximum(2.0, mu_2d + np.sqrt(mu_2d) * 0.28 * diffuse)
+    y = rng.poisson(lam).astype(np.float64)
+
+    rep = estimate_detector_statistics(y, pedestal=0.0, max_lag=7)
+    assert rep.psf_radius <= 1
+    assert rep.s2_factor > 0.82
+    assert rep.g_gamma == pytest.approx(1.0, abs=0.14)

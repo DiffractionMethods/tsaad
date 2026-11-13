@@ -17,6 +17,7 @@ from tsaad import (
     simulate_rotation_scan,
 )
 from tsaad.dxtbx_loader import (
+    _list_candidate_image_files,
     _needs_legacy_bruker_format100_workaround,
     _read_bruker_format100_panel,
     load_imageset,
@@ -501,3 +502,102 @@ def test_unpadded_directory_filenames_and_get_mask_static_extraction(tmp_path: P
     assert tile.images.shape == (12, 32, 32)
     assert np.all(tile.static_untrusted_mask[8:14, 8:12])
     assert not np.any(tile.static_untrusted_mask[0:6, 0:6])
+
+
+def test_numeric_extension_and_numbered_xds_cbf_filtering(tmp_path: Path) -> None:
+    """Numeric extensions (.001..012) group together while numbered XDS CBF tables are excluded."""
+    data_dir = tmp_path / "rayonix_dir"
+    data_dir.mkdir()
+    for idx in range(1, 13):
+        (data_dir / f"frame.{idx:03d}").write_bytes(b"stub")
+    for xds_name in ("ABSORP_001.cbf", "DECAY_001.cbf", "MODPIX_001.cbf", "BKGINIT.cbf"):
+        (data_dir / xds_name).write_bytes(b"xds_special")
+    (data_dir / "XDS.INP").write_text("JOB= XYCORR\n")
+
+    cands = _list_candidate_image_files(data_dir)
+    assert len(cands) == 12
+    assert {f.name for f in cands} == {f"frame.{idx:03d}" for idx in range(1, 13)}
+
+
+def test_nested_archive_dir_xds_filtering_and_subwindow_fast_path(tmp_path: Path) -> None:
+    """Nested `<id>/data/` archive with 200 frames + XDS `ABSORP_001.cbf` uses fast sub-window."""
+    pytest.importorskip("dxtbx")
+
+    root = tmp_path / "7lav"
+    proc_dir = root / "7lav" / "other" / "proc"
+    proc_dir.mkdir(parents=True)
+    (proc_dir / "ABSORP_001.cbf").write_bytes(b"not_a_diffraction_frame")
+
+    data_dir = root / "7lav" / "data"
+    data_dir.mkdir(parents=True)
+    for bad_cbf in ("ABSORP_001.cbf", "DECAY_001.cbf", "MODPIX_001.cbf"):
+        (data_dir / bad_cbf).write_bytes(b"xds_table")
+
+    rng = np.random.default_rng(77)
+    arr = rng.poisson(18.0, size=(24, 24)).astype(np.uint32) + 64
+    for t in range(200):
+        _write_bruker_format100_sfrm(
+            data_dir / f"xtal_{t + 1:04d}.sfrm",
+            arr,
+            baseline=64,
+            subtract_baseline=False,
+            osc_start=0.2 * t,
+            osc_inc=0.2,
+        )
+
+    tile = extract_dxtbx_tile(root, tile_size=None, max_frames=12, compute_dials_gain=False)
+    assert tile.total_frames == 200
+    assert tile.format_class == "FormatBrukerModern"
+    assert tile.images.shape == (12, 24, 24)
+    np.testing.assert_array_equal(tile.frame_indices, np.arange(94, 106))
+
+
+def test_auto_select_roi_prefers_spatial_gradient_over_flat_plateau() -> None:
+    """Multi-radius ROI selection steps off a flat inner plateau onto the solvent-ring slope."""
+    pytest.importorskip("dxtbx")
+    from dxtbx.imageset import ImageSet, ImageSetData, MemReader
+    from dxtbx.model import Beam, Detector, Panel
+    from scitbx.array_family import flex
+
+    rng = np.random.default_rng(404)
+    n_t, ny, nx = 6, 1200, 1200
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    r = np.hypot(yy - 600.0, xx - 600.0)
+    # Flat plateau (14 ADU) inside r <= 340 px, steep radial falloff (14 -> 3 ADU) across 340..650 px
+    mu = np.where(r <= 340.0, 14.0, 3.0 + 11.0 * np.exp(-((r - 340.0) / 140.0) ** 2))
+    imgs = rng.poisson(mu[None, :, :], size=(n_t, ny, nx)).astype(np.float64)
+
+    class _SimImage:
+        def __init__(self, arr_2d: np.ndarray) -> None:
+            self._raw = (flex.double(np.ascontiguousarray(arr_2d, dtype=np.float64)),)
+
+        def get_raw_data(self):
+            return self._raw
+
+    iset_data = ImageSetData(MemReader([_SimImage(imgs[t]) for t in range(n_t)]), None)
+    detector = Detector()
+    panel = Panel()
+    panel.set_name("Panel0")
+    panel.set_image_size((nx, ny))
+    panel.set_pixel_size((0.1, 0.1))
+    panel.set_trusted_range((0.0, 65535.0))
+    # Place origin so beam (0, 0, -1) intersects panel center (60.0 mm, 60.0 mm) -> (600, 600) px
+    panel.set_local_frame((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (-60.0, -60.0, -100.0))
+    detector.add_panel(panel)
+    beam = Beam((0.0, 0.0, -1.0), 1.0)
+    for t in range(n_t):
+        iset_data.set_detector(detector, t)
+        iset_data.set_beam(beam, t)
+
+    tile = extract_dxtbx_tile(
+        ImageSet(iset_data),
+        tile_size=(180, 180),
+        max_frames=6,
+        compute_dials_gain=False,
+        auto_select_roi=True,
+    )
+    y0, y1, x0, x1 = tile.bbox_yx
+    true_sub = mu[y0:y1, x0:x1]
+    # Inner primary box (672:852, 672:852) has r in [102, 356] (almost completely flat);
+    # selected ROI must sample the outer slope with substantial true background dynamic range.
+    assert float(np.percentile(true_sub, 90) - np.percentile(true_sub, 10)) > 3.5
