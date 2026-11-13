@@ -29,6 +29,7 @@ from tsaad.separation import SeparationResult
 from tsaad.trend import TrendResult
 
 if TYPE_CHECKING:
+    from matplotlib.artist import Artist
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
@@ -469,7 +470,7 @@ def plot_representative_frame_and_masks(
     _overlay_static_region_hatch(ax, border_mask)
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=f"Frame $t={t0}$ signal (ADU)")
 
-    handles = []
+    handles: list[Artist] = []
     if np.any(masking.transient_outlier_mask[t0]):
         ax.contour(
             masking.transient_outlier_mask[t0],
@@ -557,7 +558,7 @@ def plot_scan_peak_projection_and_masks(
         im, ax=ax, fraction=0.046, pad=0.04, label=r"Scan peak $\max_t Y(\mathbf{x}, t)$ (ADU)"
     )
 
-    handles = []
+    handles: list[Artist] = []
     trans_any = np.any(masking.transient_outlier_mask, axis=0)
     if np.any(trans_any):
         ax.contour(
@@ -639,7 +640,7 @@ def plot_spatial_background_and_masks(
         im, ax=ax, fraction=0.046, pad=0.04, label=r"Detrended mean $\hat{\mu}(\mathbf{x})$ (ADU)"
     )
 
-    handles = []
+    handles: list[Artist] = []
     iy, ix = np.nonzero(isolated_mask)
     if iy.size > 0:
         ax.scatter(
