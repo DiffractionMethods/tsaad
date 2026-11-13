@@ -2,13 +2,13 @@
 
 Provides individual plotting functions and an 8-panel summary figure (`plot_detector_stats_report`)
 arranged in a 2x4 grid that visualizes:
-1. Multi-Lag Photon Transfer Curves (summed spatial covariance V(mu; R) vs expected intensity mu).
+1. Multi-Lag Variance–Mean Curves (summed spatial covariance V(mu; R) vs expected intensity mu).
 2. Cumulative PSF lag-radius convergence S(R) vs lag radius R (with r_PSF plateau).
 3. Recovered 2D spatial autocorrelation kernel alpha(u).
 4. Incident beam flux scale I_0(t) and frame-wise transient outlier (Bragg/zinger) fraction.
 5. Representative single raw frame Y(x, t_0) with single-frame Bragg/zinger mask contours.
 6. Scan-wide peak projection max_t Y(x, t) with cumulative transient mask contours.
-7. Detrended mean background mu(x) with median-inpainted static bad pixels and Bragg spot footprints.
+7. Detrended mean background mu(x) with median-inpainted isolated static bad pixels.
 8. Sparse single-event cluster sum histogram (when G and gamma are separated via cluster
    multiplicity) or standardized detrended residual distribution vs N(0, 1).
 """
@@ -68,12 +68,49 @@ def _split_static_bad_mask(
     return large_mask, isolated_mask
 
 
-def plot_multi_lag_ptc(
+_STATIC_MASK_FACE = "#698296"
+_STATIC_MASK_EDGE = "#c8dce8"
+
+
+def _overlay_static_region_hatch(ax: Axes, border_mask: np.ndarray) -> None:
+    """Overlay diagonal hatch and crisp boundary on static masked regions (gaps/shadows)."""
+    if not np.any(border_mask):
+        return
+    import matplotlib as mpl
+
+    h, w = border_mask.shape
+    padded = np.pad(border_mask.astype(np.float64), 1, mode="edge")
+    xs = np.arange(-1, w + 1, dtype=np.float64)
+    ys = np.arange(-1, h + 1, dtype=np.float64)
+    with mpl.rc_context({"hatch.color": _STATIC_MASK_EDGE, "hatch.linewidth": 0.65}):
+        ax.contourf(
+            xs,
+            ys,
+            padded,
+            levels=[0.5, 1.5],
+            colors=["none"],
+            hatches=["////"],
+            zorder=3,
+        )
+    ax.contour(
+        xs,
+        ys,
+        padded,
+        levels=[0.5],
+        colors=[_STATIC_MASK_EDGE],
+        linewidths=0.85,
+        zorder=4,
+    )
+    ax.set_xlim(-0.5, w - 0.5)
+    ax.set_ylim(-0.5, h - 0.5)
+
+
+def plot_multi_lag_variance_mean(
     cov: CovarianceResult,
     ax: Axes | None = None,
     true_detector: DetectorConfig | None = None,
 ) -> Axes:
-    """Plot Multi-Lag Photon Transfer Curves V_total(mu; R) vs expected signal mu."""
+    """Plot Multi-Lag Variance–Mean Curves V_total(mu; R) vs expected signal mu."""
     plt = _get_pyplot()
     if ax is None:
         _, ax = plt.subplots(figsize=(5.5, 4.2))
@@ -169,10 +206,14 @@ def plot_multi_lag_ptc(
 
     ax.set_xlabel(r"Expected background signal $\mu$ (ADU)", fontsize=9.5)
     ax.set_ylabel(r"Lag-summed covariance $V_{\mathrm{total}}(\mu; R)$ ($\mathrm{ADU}^2$)", fontsize=9.5)
-    ax.set_title("Multi-Lag Photon Transfer Curve (PTC)", fontsize=10.5, fontweight="bold")
+    ax.set_title("Multi-Lag Variance\u2013Mean Curves", fontsize=10.5, fontweight="bold")
     ax.grid(True, linestyle=":", alpha=0.5)
     ax.legend(fontsize=7.6, loc="upper left", framealpha=0.9)
     return ax
+
+
+# Backwards-compatible alias for v0.1.0 callers
+plot_multi_lag_ptc = plot_multi_lag_variance_mean
 
 
 def plot_radial_convergence(
@@ -423,16 +464,21 @@ def plot_representative_frame_and_masks(
         else float(np.max(frame_t0))
     )
     masked_t0 = np.ma.masked_where(border_mask, frame_t0)
-    cmap = plt.get_cmap("magma").with_extremes(bad="#3a3a4a")
+    cmap = plt.get_cmap("magma").with_extremes(bad=_STATIC_MASK_FACE)
     im = ax.imshow(masked_t0, origin="lower", cmap=cmap, vmin=0.0, vmax=max(vmax, 1.0))
+    _overlay_static_region_hatch(ax, border_mask)
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=f"Frame $t={t0}$ signal (ADU)")
 
+    handles = []
     if np.any(masking.transient_outlier_mask[t0]):
         ax.contour(
             masking.transient_outlier_mask[t0],
             levels=[0.5],
             colors=["#00ffff"],
             linewidths=1.3,
+        )
+        handles.append(
+            Line2D([0], [0], color="#00ffff", lw=1.4, label=f"Bragg/zinger mask ($t={t0}$)")
         )
 
     iy, ix = np.nonzero(isolated_mask)
@@ -447,22 +493,31 @@ def plot_representative_frame_and_masks(
             linewidths=1.3,
             zorder=5,
         )
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="s",
+                color="none",
+                markeredgecolor="#00ff66",
+                markeredgewidth=1.3,
+                markersize=5.5,
+                label="Hot/dead px (static)",
+            )
+        )
 
-    handles = [
-        Line2D([0], [0], color="#00ffff", lw=1.4, label=f"Bragg/zinger mask ($t={t0}$)"),
-        Line2D(
-            [0],
-            [0],
-            marker="s",
-            color="none",
-            markeredgecolor="#00ff66",
-            markeredgewidth=1.3,
-            markersize=5.5,
-            label="Hot/dead px (static)",
-        ),
-        Patch(facecolor="#3a3a4a", edgecolor="white", linewidth=0.5, label="Static shadow/corner"),
-    ]
-    ax.legend(handles=handles, loc="upper right", fontsize=7.2, framealpha=0.88)
+    if np.any(border_mask):
+        handles.append(
+            Patch(
+                facecolor=_STATIC_MASK_FACE,
+                edgecolor=_STATIC_MASK_EDGE,
+                hatch="////",
+                linewidth=0.7,
+                label="Static mask (gap/shadow)",
+            )
+        )
+    if handles:
+        ax.legend(handles=handles, loc="upper right", fontsize=7.2, framealpha=0.88)
     ax.set_xlabel("Pixel $x$", fontsize=9.5)
     ax.set_ylabel("Pixel $y$", fontsize=9.5)
     ax.set_title(f"Single Raw Frame (t={t0}) & Frame Mask", fontsize=10.5, fontweight="bold")
@@ -495,12 +550,14 @@ def plot_scan_peak_projection_and_masks(
         else float(np.max(peak_proj))
     )
     masked_peak = np.ma.masked_where(border_mask, peak_proj)
-    cmap = plt.get_cmap("magma").with_extremes(bad="#3a3a4a")
+    cmap = plt.get_cmap("magma").with_extremes(bad=_STATIC_MASK_FACE)
     im = ax.imshow(masked_peak, origin="lower", cmap=cmap, vmin=0.0, vmax=max(vmax, 1.0))
+    _overlay_static_region_hatch(ax, border_mask)
     plt.colorbar(
         im, ax=ax, fraction=0.046, pad=0.04, label=r"Scan peak $\max_t Y(\mathbf{x}, t)$ (ADU)"
     )
 
+    handles = []
     trans_any = np.any(masking.transient_outlier_mask, axis=0)
     if np.any(trans_any):
         ax.contour(
@@ -510,6 +567,7 @@ def plot_scan_peak_projection_and_masks(
             linewidths=0.9,
             alpha=0.85,
         )
+        handles.append(Line2D([0], [0], color="#00ffff", lw=1.2, label="Cumulative mask (all $t$)"))
 
     iy, ix = np.nonzero(isolated_mask)
     if iy.size > 0:
@@ -523,22 +581,31 @@ def plot_scan_peak_projection_and_masks(
             linewidths=1.3,
             zorder=5,
         )
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="s",
+                color="none",
+                markeredgecolor="#00ff66",
+                markeredgewidth=1.3,
+                markersize=5.5,
+                label="Hot/dead px (static)",
+            )
+        )
 
-    handles = [
-        Line2D([0], [0], color="#00ffff", lw=1.2, label="Cumulative mask (all $t$)"),
-        Line2D(
-            [0],
-            [0],
-            marker="s",
-            color="none",
-            markeredgecolor="#00ff66",
-            markeredgewidth=1.3,
-            markersize=5.5,
-            label="Hot/dead px (static)",
-        ),
-        Patch(facecolor="#3a3a4a", edgecolor="white", linewidth=0.5, label="Shadowed border"),
-    ]
-    ax.legend(handles=handles, loc="upper right", fontsize=7.2, framealpha=0.88)
+    if np.any(border_mask):
+        handles.append(
+            Patch(
+                facecolor=_STATIC_MASK_FACE,
+                edgecolor=_STATIC_MASK_EDGE,
+                hatch="////",
+                linewidth=0.7,
+                label="Static mask (gap/shadow)",
+            )
+        )
+    if handles:
+        ax.legend(handles=handles, loc="upper right", fontsize=7.2, framealpha=0.88)
     ax.set_xlabel("Pixel $x$", fontsize=9.5)
     ax.set_ylabel("Pixel $y$", fontsize=9.5)
     ax.set_title("Scan Peak Projection & Cumulative Mask", fontsize=10.5, fontweight="bold")
@@ -550,7 +617,7 @@ def plot_spatial_background_and_masks(
     masking: MaskingResult,
     ax: Axes | None = None,
 ) -> Axes:
-    """Plot detrended mean background mu(x) with inpainted static bad pixels and spot footprints."""
+    """Plot detrended mean background mu(x) with inpainted isolated static bad pixels."""
     plt = _get_pyplot()
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -565,22 +632,14 @@ def plot_spatial_background_and_masks(
         mean_bg[isolated_mask] = mean_bg_smooth[isolated_mask]
 
     masked_bg = np.ma.masked_where(border_mask, mean_bg)
-    cmap = plt.get_cmap("magma").with_extremes(bad="#3a3a4a")
+    cmap = plt.get_cmap("magma").with_extremes(bad=_STATIC_MASK_FACE)
     im = ax.imshow(masked_bg, origin="lower", cmap=cmap, vmin=0.0)
+    _overlay_static_region_hatch(ax, border_mask)
     plt.colorbar(
         im, ax=ax, fraction=0.046, pad=0.04, label=r"Detrended mean $\hat{\mu}(\mathbf{x})$ (ADU)"
     )
 
-    trans_frac = 100.0 * np.mean(masking.transient_outlier_mask, axis=0)
-    if np.any(trans_frac >= 5.0):
-        ax.contour(
-            trans_frac,
-            levels=[5.0],
-            colors=["#00ffff"],
-            linewidths=1.0,
-            alpha=0.85,
-        )
-
+    handles = []
     iy, ix = np.nonzero(isolated_mask)
     if iy.size > 0:
         ax.scatter(
@@ -593,22 +652,31 @@ def plot_spatial_background_and_masks(
             linewidths=1.3,
             zorder=5,
         )
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="s",
+                color="none",
+                markeredgecolor="#00ff66",
+                markeredgewidth=1.3,
+                markersize=5.5,
+                label="Hot/dead px (inpainted)",
+            )
+        )
 
-    handles = [
-        Line2D([0], [0], color="#00ffff", lw=1.2, label=r"Spot footprints ($\geq 5\%$ frames)"),
-        Line2D(
-            [0],
-            [0],
-            marker="s",
-            color="none",
-            markeredgecolor="#00ff66",
-            markeredgewidth=1.3,
-            markersize=5.5,
-            label="Hot/dead px (inpainted)",
-        ),
-        Patch(facecolor="#3a3a4a", edgecolor="white", linewidth=0.5, label="Shadowed border"),
-    ]
-    ax.legend(handles=handles, loc="upper right", fontsize=7.2, framealpha=0.88)
+    if np.any(border_mask):
+        handles.append(
+            Patch(
+                facecolor=_STATIC_MASK_FACE,
+                edgecolor=_STATIC_MASK_EDGE,
+                hatch="////",
+                linewidth=0.7,
+                label="Static mask (gap/shadow)",
+            )
+        )
+    if handles:
+        ax.legend(handles=handles, loc="upper right", fontsize=7.2, framealpha=0.88)
 
     static_pct = 100.0 * float(np.mean(masking.static_bad_mask))
     trans_pct = 100.0 * float(np.mean(masking.transient_outlier_mask))
@@ -763,7 +831,7 @@ def plot_detector_stats_report(
     fig, axes = plt.subplots(2, 4, figsize=(21.5, 9.8), constrained_layout=True)
 
     # Top row: statistical & temporal models
-    plot_multi_lag_ptc(report.covariance, ax=axes[0, 0], true_detector=true_detector)
+    plot_multi_lag_variance_mean(report.covariance, ax=axes[0, 0], true_detector=true_detector)
     plot_radial_convergence(report.covariance, ax=axes[0, 1], true_detector=true_detector)
     plot_psf_autocorrelation_kernel(report.covariance, ax=axes[0, 2])
     plot_incident_flux_and_outliers(

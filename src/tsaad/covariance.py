@@ -633,7 +633,7 @@ def estimate_lagged_covariance(
             cfg=cfg,
         )
 
-        # 1. Fit zero-lag Photon Transfer Curve: C(0; mu_b) = g(0) * mu_b + psi
+        # 1. Fit zero-lag variance-mean relation: C(0; mu_b) = g(0) * mu_b + psi
         c0_bins = bin_cov_use[:, L, L]
         g0, psi, g0_se, psi_se, _ = _irls_linear_fit(
             bin_means,

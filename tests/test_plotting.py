@@ -16,6 +16,8 @@ from tsaad import (  # noqa: E402
     SceneConfig,
     estimate_detector_statistics,
     plot_detector_stats_report,
+    plot_multi_lag_ptc,
+    plot_multi_lag_variance_mean,
     simulate_rotation_scan,
 )
 from tsaad.cli import main as cli_main  # noqa: E402
@@ -38,6 +40,15 @@ def test_plot_detector_stats_report_pt_ccd(tmp_path: Path) -> None:
     )
     try:
         assert len(fig.axes) >= 8
+        assert fig.axes[0].get_title() == "Multi-Lag Variance\u2013Mean Curves"
+        assert plot_multi_lag_ptc is plot_multi_lag_variance_mean
+        # Detrended Mean panel (bottom row, 3rd subplot) must not show spot-footprint contours
+        detrended_ax = [ax for ax in fig.axes if ax.get_title().startswith("Detrended Mean")][0]
+        leg = detrended_ax.get_legend()
+        if leg is not None:
+            labels = [t.get_text() for t in leg.get_texts()]
+            assert all("Spot footprints" not in lbl for lbl in labels)
+            assert any("Static mask" in lbl for lbl in labels)
         assert out_png.exists()
         assert out_png.stat().st_size > 10_000
     finally:
@@ -71,6 +82,15 @@ def test_plot_detector_stats_report_timepix_sparse_clusters(tmp_path: Path) -> N
     )
     try:
         assert len(fig.axes) >= 8
+        assert fig.axes[0].get_title() == "Multi-Lag Variance\u2013Mean Curves"
+        assert plot_multi_lag_ptc is plot_multi_lag_variance_mean
+        # Detrended Mean panel (bottom row, 3rd subplot) must not show spot-footprint contours
+        detrended_ax = [ax for ax in fig.axes if ax.get_title().startswith("Detrended Mean")][0]
+        leg = detrended_ax.get_legend()
+        if leg is not None:
+            labels = [t.get_text() for t in leg.get_texts()]
+            assert all("Spot footprints" not in lbl for lbl in labels)
+            assert any("Static mask" in lbl for lbl in labels)
         assert out_png.exists()
         assert out_png.stat().st_size > 10_000
     finally:

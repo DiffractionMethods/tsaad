@@ -100,11 +100,21 @@ def test_estimate_from_dxtbx_memreader_imageset() -> None:
 
 
 def test_beamstop_shadow_penumbra_dilation() -> None:
-    """Verify that an interior circular beamstop shadow with a soft penumbra is dilated."""
-    from tsaad import detect_static_bad_pixels
+    """Verify that an interior circular beamstop shadow with a soft penumbra is dilated,
+    stays intact under transient Bragg peaks, and does not dilate digital `-1` module gaps.
+    """
+    from tsaad import MaskingConfig, detect_static_bad_pixels
 
     det_cfg = DetectorConfig.pt_ccd_waterman_evans(pedestal=40.0, psf_radius=3)
-    scene_cfg = SceneConfig(n_frames=30, height=96, width=96, n_bragg_spots=20, shadow_margin_px=0)
+    scene_cfg = SceneConfig(
+        n_frames=30,
+        height=96,
+        width=96,
+        n_bragg_spots=20,
+        n_hot_pixels=0,
+        n_dead_pixels=0,
+        shadow_margin_px=0,
+    )
     sim = simulate_rotation_scan(det_cfg, scene_cfg, seed=7)
 
     # Inject a synthetic circular beamstop shadow (radius 10 px) with a 4-px soft penumbra
@@ -112,11 +122,21 @@ def test_beamstop_shadow_penumbra_dilation() -> None:
     r_bs = np.hypot(y - 48.0, x - 48.0)
     atten = np.clip((r_bs - 10.0) / 4.0, 0.0, 1.0)
     imgs = det_cfg.pedestal + (sim.images - det_cfg.pedestal) * atten[None, :, :]
+    # Inject a bright 2-frame Bragg reflection right on the penumbra rim (r ~ 11.5 px)
+    imgs[5:7, 36:38, 47:50] += 2500.0
+    # Inject a crisp 4-px digital `-1` inter-module gap far from the beamstop
+    imgs[:, 12:16, :] = -1.0
 
-    static_mask = detect_static_bad_pixels(imgs, pedestal=det_cfg.pedestal)
-    # Both the core (r <= 10) and the inner penumbra (10 < r <= 12.5) must be masked
+    cfg = MaskingConfig(trusted_range=(0.0, 65535.0))
+    static_mask = detect_static_bad_pixels(imgs, pedestal=det_cfg.pedestal, config=cfg)
+    # Physical beamstop core + penumbra (including Bragg-hit rim pixels) must be masked
     assert np.all(static_mask[r_bs <= 10.0])
+    assert np.all(static_mask[36:38, 47:50])
     assert np.mean(static_mask[(r_bs > 10.0) & (r_bs <= 12.5)]) > 0.85
+    # Digital `-1` module gap must be masked pixel-exactly without dilating into rows 10..11 or 16..17
+    assert np.all(static_mask[12:16, :])
+    assert not np.any(static_mask[9:12, :])
+    assert not np.any(static_mask[16:19, :])
 
 
 def test_dxtbx_saturated_bragg_spot_stays_dynamic_not_static() -> None:

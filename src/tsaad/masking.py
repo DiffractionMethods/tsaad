@@ -298,7 +298,9 @@ def detect_static_bad_pixels(
         > (config.hot_pixel_spatial_sigma * scale_floor + 6.0 * q_scale)
     )
     dead_mask |= all_nonfinite_2d | cold_mask
+    dead_physical_mask = dead_mask.copy()
 
+    underflow_2d = np.zeros((height, width), dtype=bool)
     if config.trusted_range is not None:
         min_sub = float(config.trusted_range[0]) - ped_val
         max_sub = float(config.trusted_range[1]) - ped_val
@@ -313,7 +315,12 @@ def detect_static_bad_pixels(
         hot_mask |= always_saturated_2d
 
     # 3. Shadowed border strips around the perimeter
-    global_ref = float(np.percentile(temp_mean, 60.0))
+    non_underflow = ~underflow_2d
+    global_ref = (
+        float(np.percentile(temp_mean[non_underflow], 60.0))
+        if np.any(non_underflow)
+        else float(np.percentile(temp_mean, 60.0))
+    )
     shadow_thresh = max(
         3.5 * read_sigma_est / np.sqrt(max(n_frames, 1)),
         0.02 * global_ref,
@@ -342,14 +349,22 @@ def detect_static_bad_pixels(
             else:
                 break
 
-    # 4. Interior beamstop / arm shadow and soft penumbra dilation
-    low_5_pct = float(np.percentile(temp_mean[~shadow_mask], 5.0)) if np.any(~shadow_mask) else 0.0
+    # 4. Interior beamstop / arm shadow and soft penumbra dilation.
+    # Digital `< min_trusted` hardware sentinels (`underflow_2d`, e.g. -1 module gaps) have crisp
+    # pixel boundaries and no optical penumbra, so exclude them from penumbra dilation; evaluate
+    # the penumbra profile on `temp_median` so transient Bragg spots cannot punch holes in it.
+    interior_eligible = (~shadow_mask) & non_underflow
+    low_5_pct = (
+        float(np.percentile(temp_median[interior_eligible], 5.0))
+        if np.any(interior_eligible)
+        else 0.0
+    )
     has_high_background_floor = low_5_pct > 2.0 * q_scale
-    raw_shadow_candidates = (dead_mask & (~shadow_mask)) | (
+    raw_shadow_candidates = (dead_physical_mask & interior_eligible) | (
         has_high_background_floor
         & (global_ref > 15.0 * q_scale)
-        & (temp_mean <= config.shadow_rel_threshold * global_ref)
-        & (~shadow_mask)
+        & (temp_median <= config.shadow_rel_threshold * global_ref)
+        & interior_eligible
     )
     if np.any(raw_shadow_candidates) and config.shadow_penumbra_dilation_px > 0:
         labeled_sh, n_sh = label(raw_shadow_candidates)
@@ -364,18 +379,19 @@ def detect_static_bad_pixels(
             r_pen = int(config.shadow_penumbra_dilation_px)
             yy, xx = np.mgrid[-r_pen : r_pen + 1, -r_pen : r_pen + 1]
             disk_pen = (yy * yy + xx * xx) <= (r_pen + 0.35) ** 2
-            dilated_zone = binary_dilation(interior_shadow_core, structure=disk_pen)
-            valid_outside = ~(shadow_mask | interior_shadow_core)
+            dilated_zone = binary_dilation(interior_shadow_core, structure=disk_pen) & non_underflow
+            valid_outside = ~(shadow_mask | interior_shadow_core | underflow_2d)
             ref_level = (
-                float(np.percentile(temp_mean[valid_outside], 65.0))
+                float(np.percentile(temp_median[valid_outside], 65.0))
                 if np.any(valid_outside)
                 else global_ref
             )
-            gx = uniform_filter(np.abs(np.gradient(temp_mean, axis=1)), size=3, mode="nearest")
-            gy = uniform_filter(np.abs(np.gradient(temp_mean, axis=0)), size=3, mode="nearest")
+            med_for_grad = np.where(underflow_2d, ref_level, temp_median)
+            gx = uniform_filter(np.abs(np.gradient(med_for_grad, axis=1)), size=3, mode="nearest")
+            gy = uniform_filter(np.abs(np.gradient(med_for_grad, axis=0)), size=3, mode="nearest")
             grad_mag = np.hypot(gx, gy)
             penumbra_mask = dilated_zone & (
-                (temp_mean < config.shadow_penumbra_rel_level * ref_level)
+                (temp_median < config.shadow_penumbra_rel_level * ref_level)
                 | (grad_mag > 0.04 * max(ref_level, q_scale))
             )
             shadow_mask |= interior_shadow_core | penumbra_mask
